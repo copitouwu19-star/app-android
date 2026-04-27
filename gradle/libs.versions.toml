@@ -1,0 +1,33 @@
+[versions]
+agp              = "8.3.2"
+kotlin           = "1.9.24"
+coreKtx          = "1.12.0"
+appcompat        = "1.6.1"
+constraintlayout = "2.1.4"
+camerax          = "1.3.4"
+tflite           = "2.14.0"
+tflite-support   = "0.4.4"
+coroutines       = "1.7.3"
+junit            = "4.13.2"
+androidx-test-ext     = "1.1.5"
+androidx-test-espresso = "3.5.1"
+
+[libraries]
+androidx-core-ktx         = { group = "androidx.core",             name = "core-ktx",              version.ref = "coreKtx"               }
+androidx-appcompat        = { group = "androidx.appcompat",        name = "appcompat",              version.ref = "appcompat"             }
+androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout",       version.ref = "constraintlayout"      }
+camera-core               = { group = "androidx.camera",           name = "camera-core",            version.ref = "camerax"               }
+camera-camera2            = { group = "androidx.camera",           name = "camera-camera2",         version.ref = "camerax"               }
+camera-lifecycle          = { group = "androidx.camera",           name = "camera-lifecycle",       version.ref = "camerax"               }
+camera-view               = { group = "androidx.camera",           name = "camera-view",            version.ref = "camerax"               }
+tflite                    = { group = "org.tensorflow",            name = "tensorflow-lite",        version.ref = "tflite"                }
+tflite-gpu                = { group = "org.tensorflow",            name = "tensorflow-lite-gpu",    version.ref = "tflite"                }
+tflite-support            = { group = "org.tensorflow",            name = "tensorflow-lite-support", version.ref = "tflite-support"       }
+coroutines-android        = { group = "org.jetbrains.kotlinx",     name = "kotlinx-coroutines-android", version.ref = "coroutines"       }
+junit                     = { group = "junit",                     name = "junit",                  version.ref = "junit"                 }
+androidx-test-ext         = { group = "androidx.test.ext",         name = "junit",                  version.ref = "androidx-test-ext"     }
+androidx-test-espresso    = { group = "androidx.test.espresso",    name = "espresso-core",          version.ref = "androidx-test-espresso"}
+
+[plugins]
+android-application = { id = "com.android.application",      version.ref = "agp"    }
+kotlin-android      = { id = "org.jetbrains.kotlin.android",  version.ref = "kotlin" }
