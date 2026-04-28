@@ -2,16 +2,60 @@
 <androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="#000000"
+    tools:context=".MainActivity">
 
+    <!-- Vista de cámara — ocupa toda la pantalla -->
     <androidx.camera.view.PreviewView
         android:id="@+id/viewFinder"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <!-- Overlay de detecciones — se dibuja ENCIMA de la cámara -->
+    <!-- Transparente, solo pinta los bounding boxes -->
+    <com.example.myapp.DetectionOverlay
+        android:id="@+id/detectionOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <!-- Etiqueta de modo escaneo — visible solo cuando el usuario debe rotar -->
+    <TextView
+        android:id="@+id/scanModeLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="◀ ESCANEA ▶"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:background="#AA000000"
+        android:padding="12dp"
+        android:visibility="gone"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginBottom="40dp" />
+
+    <!-- Indicador de modo: DEBUG (con boxes) o NORMAL -->
+    <TextView
+        android:id="@+id/modeIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="● DEMO"
+        android:textColor="#00FF00"
+        android:textSize="12sp"
+        android:background="#AA000000"
+        android:padding="6dp"
+        android:visibility="visible"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginTop="16dp"
+        android:layout_marginEnd="16dp" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

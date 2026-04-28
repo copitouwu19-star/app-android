@@ -3,24 +3,25 @@ package com.example.myapp
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.Matrix
-import android.graphics.RectF
+import android.graphics.*
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.*
 import android.speech.tts.TextToSpeech
+import android.util.AttributeSet
 import android.util.Log
+import android.view.View
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
+import androidx.camera.core.Camera
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import org.tensorflow.lite.Interpreter
-//import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -39,26 +40,28 @@ internal const val MODELO_YOLO  = "yolov8n_320.tflite"
 internal const val MODELO_DEPTH = "midas_v21_small_256.tflite"
 
 internal const val YOLO_INPUT_SIZE = 320
-internal const val SCORE_MINIMO    = 0.45f
+internal const val SCORE_MINIMO    = 0.35f  // más sensible para detectar desde lejos
 internal const val NMS_IOU_THRESH  = 0.45f
-internal const val MAX_DETECCIONES = 10
+internal const val MAX_DETECCIONES = 15     // más detecciones para contexto completo
 
 internal const val ZONA_IZQ = 0.30f
 internal const val ZONA_DER = 0.70f
 
-// Umbrales de profundidad — ajustados tras pruebas reales
-// Si detectas falsos positivos baja DEPTH_PELIGRO a 0.70
-// Si no detecta obstáculos cercanos súbelo a 0.80
-internal const val DEPTH_PELIGRO = 0.75f
-internal const val DEPTH_CERCA   = 0.55f
-internal const val DEPTH_AVISO   = 0.38f
+// Umbrales de profundidad — 5 niveles de distancia
+// 0 = muy lejos, 1 = muy cerca
+internal const val DEPTH_CRITICO  = 0.78f  // nivel 4: choque inminente
+internal const val DEPTH_PELIGRO  = 0.62f  // nivel 3: detente/gira
+internal const val DEPTH_CERCA    = 0.48f  // nivel 2: desvíate (≈3-4m)
+internal const val DEPTH_AVISO    = 0.32f  // nivel 1: prepárate (≈5m)
+internal const val DEPTH_LEJANO   = 0.18f  // nivel 0: mención contextual (≈7m)
 
 // Tracking
-internal const val IOU_MIN_MATCH      = 0.30f
-internal const val MAX_FRAMES_PERDIDO = 5
-internal const val KALMAN_SMOOTH      = 0.6f
-internal const val MIN_VELOCITY_WARN  = 0.015f
-internal const val COLLISION_FRAMES   = 8
+internal const val IOU_MIN_MATCH           = 0.25f
+internal const val MAX_FRAMES_PERDIDO      = 6
+internal const val KALMAN_SMOOTH           = 0.55f
+internal const val MIN_VELOCITY_WARN       = 0.012f
+internal const val COLLISION_FRAMES        = 10
+internal const val MIN_FRAMES_CONFIRMACION = 2  // reducido para respuesta más rápida
 
 // Flash
 internal const val DARK_THRESHOLD   = 55
@@ -66,23 +69,24 @@ internal const val TORCH_OFF_THRESH = 115
 internal const val TORCH_DEBOUNCE   = 5_000L
 internal const val BRIGHT_SAMPLES   = 8
 
-// ── COOLDOWNS AJUSTADOS PARA INVIDENTE ────────────────────────────────────────
-// Más cortos en peligro, más largos en contexto para no saturar
-internal const val COOLDOWN_PELIGRO    = 2_500L  // alertas urgentes: cada 2.5s
-internal const val COOLDOWN_NAVEGACION = 4_000L  // desvíos: cada 4s
-internal const val COOLDOWN_LIBRE      = 20_000L // "camino libre": cada 20s (era 14s)
-internal const val COOLDOWN_QUIETO     = 25_000L // quietud: cada 25s
-internal const val COOLDOWN_POST_SPEAK = 6_000L
-internal const val COOLDOWN_ESCENA     = 45_000L // escena: cada 45s (era 30s)
-internal const val COOLDOWN_CRUCE      = 10_000L
+// Cooldowns TTS
+internal const val COOLDOWN_CRITICO    = 1_500L  // peligro máximo: 1.5s
+internal const val COOLDOWN_PELIGRO    = 2_500L
+internal const val COOLDOWN_NAVEGACION = 3_500L
+internal const val COOLDOWN_QUIETO     = 25_000L
+internal const val COOLDOWN_POST_SPEAK = 5_000L
+internal const val COOLDOWN_ESCENA     = 40_000L
+internal const val COOLDOWN_CRUCE      = 8_000L
 internal const val STILLNESS_MS        = 7_000L
 
-// ── FILTRO ANTI-SPAM ──────────────────────────────────────────────────────────
-// Solo hablar si el nivel de peligro cambió O si pasó el cooldown
-internal const val MIN_FRAMES_CONFIRMACION = 3  // frames consecutivos antes de hablar
+// Escaneo con giroscopio
+internal const val SCAN_TRIGGER_DEPTH   = 0.70f   // si hay peligro y no se ve bien → pedir escaneo
+internal const val SCAN_ROTATION_DEG    = 15f     // grados de rotación para considerar que escaneó
+internal const val SCAN_COOLDOWN        = 15_000L // cada 15s puede pedir escaneo
+internal const val SCAN_TIMEOUT_MS      = 8_000L  // 8s para completar el escaneo
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ETIQUETAS COCO — 80 clases YOLOv8n
+// ETIQUETAS COCO — 80 clases
 // ─────────────────────────────────────────────────────────────────────────────
 internal val COCO_LABELS = listOf(
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -101,13 +105,14 @@ internal val COCO_LABELS = listOf(
 internal val VEHICLES       = setOf("bicycle","car","motorcycle","bus","train","truck","boat")
 internal val ANIMALS        = setOf("bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe")
 internal val INDOOR_OBJS    = setOf("chair","couch","bed","dining table","toilet","tv","laptop",
-    "sink","refrigerator","potted plant","clock","cup","bottle","cell phone")
+    "sink","refrigerator","potted plant","clock","cup","bottle","cell phone","microwave","oven","toaster","book")
 internal val OUTDOOR_OBJS   = setOf("car","truck","bus","motorcycle","bicycle",
-    "traffic light","stop sign","fire hydrant","bench","train","boat")
-internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","bus","bicycle")
+    "traffic light","stop sign","fire hydrant","bench","train","boat","parking meter")
+internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","bus","bicycle","motorcycle")
 
-// ── MENSAJES CORTOS PARA INVIDENTE ────────────────────────────────────────────
-// Máximo 5-6 palabras por mensaje de peligro — el TTS debe terminar rápido
+// Objetos peligrosos a cualquier distancia (avisar aunque estén lejos)
+internal val HIGH_PRIORITY_OBJS = setOf("car","truck","bus","motorcycle","bicycle","person","dog","stairs")
+
 internal data class LabelEs(val art: String, val noun: String, val short: String)
 internal val LABEL_ES = mapOf(
     "person"        to LabelEs("una","persona","persona"),
@@ -121,7 +126,7 @@ internal val LABEL_ES = mapOf(
     "boat"          to LabelEs("un","bote","bote"),
     "traffic light" to LabelEs("un","semáforo","semáforo"),
     "fire hydrant"  to LabelEs("un","hidrante","hidrante"),
-    "stop sign"     to LabelEs("una","señal de alto","señal de alto"),
+    "stop sign"     to LabelEs("una","señal de alto","señal"),
     "bench"         to LabelEs("una","banca","banca"),
     "bird"          to LabelEs("un","pájaro","pájaro"),
     "cat"           to LabelEs("un","gato","gato"),
@@ -149,11 +154,100 @@ internal val LABEL_ES = mapOf(
     "cup"           to LabelEs("una","taza","taza"),
     "clock"         to LabelEs("un","reloj","reloj"),
     "sports ball"   to LabelEs("una","pelota","pelota"),
-    "stairs"        to LabelEs("unas","escaleras","escaleras")
+    "stairs"        to LabelEs("unas","escaleras","escaleras"),
+    "book"          to LabelEs("un","libro","libro"),
+    "vase"          to LabelEs("un","florero","florero")
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DETECCIÓN — YOLOv8n TFLite
+// OVERLAY VISUAL — dibuja bounding boxes sobre la cámara (modo demo)
+// ─────────────────────────────────────────────────────────────────────────────
+class DetectionOverlay @JvmOverloads constructor(
+    context: Context, attrs: AttributeSet? = null
+) : View(context, attrs) {
+
+    // Colores por nivel de peligro
+    private val paintCritico   = Paint().apply { color = Color.RED;    strokeWidth = 6f; style = Paint.Style.STROKE }
+    private val paintPeligro   = Paint().apply { color = Color.parseColor("#FF6600"); strokeWidth = 5f; style = Paint.Style.STROKE }
+    private val paintCerca     = Paint().apply { color = Color.YELLOW; strokeWidth = 4f; style = Paint.Style.STROKE }
+    private val paintAviso     = Paint().apply { color = Color.parseColor("#00CCFF"); strokeWidth = 3f; style = Paint.Style.STROKE }
+    private val paintLejano    = Paint().apply { color = Color.WHITE;  strokeWidth = 2f; style = Paint.Style.STROKE; alpha = 150 }
+
+    private val paintText = Paint().apply {
+        color     = Color.WHITE
+        textSize  = 36f
+        typeface  = Typeface.DEFAULT_BOLD
+        setShadowLayer(3f, 1f, 1f, Color.BLACK)
+    }
+    private val paintTextBg = Paint().apply {
+        color = Color.parseColor("#AA000000")
+        style = Paint.Style.FILL
+    }
+
+    // Lista de detecciones actual — actualizada desde el hilo de análisis
+    @Volatile private var detections: List<Pair<RectF, Pair<String, Float>>> = emptyList()
+    @Volatile private var imgW = 1; @Volatile private var imgH = 1
+
+    fun update(dets: List<Pair<RectF, Pair<String, Float>>>, width: Int, height: Int) {
+        detections = dets; imgW = width; imgH = height
+        postInvalidate()  // pide redibujo en el hilo UI
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val dets = detections; if (dets.isEmpty()) return
+
+        val scaleX = width.toFloat()
+        val scaleY = height.toFloat()
+
+        for ((normBox, labelScore) in dets) {
+            val (label, score) = labelScore
+
+            // Desnormalizar a píxeles de pantalla
+            val left   = normBox.left   * scaleX
+            val top    = normBox.top    * scaleY
+            val right  = normBox.right  * scaleX
+            val bottom = normBox.bottom * scaleY
+
+            val area  = normBox.width() * normBox.height()
+            val depth = when {
+                area >= 0.20f -> 0.85f
+                area >= 0.08f -> 0.65f
+                area >= 0.03f -> 0.48f
+                area >= 0.01f -> 0.32f
+                else          -> 0.18f
+            }
+
+            // Seleccionar color según nivel de peligro
+            val paint = when {
+                depth >= DEPTH_CRITICO -> paintCritico
+                depth >= DEPTH_PELIGRO -> paintPeligro
+                depth >= DEPTH_CERCA   -> paintCerca
+                depth >= DEPTH_AVISO   -> paintAviso
+                else                   -> paintLejano
+            }
+
+            // Dibujar bounding box
+            canvas.drawRect(left, top, right, bottom, paint)
+
+            // Etiqueta con nombre y score
+            val shortName = LABEL_ES[label]?.short ?: label
+            val labelText = "$shortName ${(score * 100).toInt()}%"
+            val textW = paintText.measureText(labelText)
+            val textH = paintText.textSize
+
+            // Fondo de la etiqueta
+            canvas.drawRect(left, top - textH - 8f, left + textW + 12f, top, paintTextBg)
+
+            // Color del texto igual al del box
+            paintText.color = paint.color
+            canvas.drawText(labelText, left + 6f, top - 6f, paintText)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETECTOR YOLO — CPU pura (sin GpuDelegate para estabilidad)
 // ─────────────────────────────────────────────────────────────────────────────
 data class Detection(val box: RectF, val label: String, val score: Float)
 
@@ -165,17 +259,15 @@ class YoloDetector(modelPath: String, context: Context) {
             val fd     = context.assets.openFd(modelPath)
             val buffer = FileInputStream(fd.fileDescriptor).channel
                 .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-            val options = Interpreter.Options().apply {
-                numThreads = 4
-                Log.d(TAG, "YOLO: CPU x4 hilos")
-            }
-            interpreter = Interpreter(buffer, options)
-            Log.d(TAG, "YOLOv8n OK")
+            // CPU x4 hilos — estable en todos los dispositivos
+            // En Snapdragon 7s Gen 4 esto da ~80-120ms por frame
+            interpreter = Interpreter(buffer, Interpreter.Options().apply { numThreads = 4 })
+            Log.d(TAG, "YOLOv8n OK — CPU x4")
         } catch (e: Exception) { Log.e(TAG, "Error YOLO: ${e.message}") }
     }
 
     fun detect(bitmap: Bitmap): List<Detection> {
-        val interp = interpreter ?: return emptyList()
+        val interp  = interpreter ?: return emptyList()
         val scaled  = Bitmap.createScaledBitmap(bitmap, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, true)
         val inputBuf = ByteBuffer.allocateDirect(4 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3)
             .order(ByteOrder.nativeOrder())
@@ -188,8 +280,7 @@ class YoloDetector(modelPath: String, context: Context) {
         }
         inputBuf.rewind()
 
-        val numAnchors = 2100  // para imgsz=320: 2100 anchors
-        val outputBuf  = Array(1) { Array(84) { FloatArray(numAnchors) } }
+        val outputBuf = Array(1) { Array(84) { FloatArray(2100) } }
         try { interp.run(inputBuf, outputBuf) }
         catch (e: Exception) { Log.e(TAG, "YOLO inf: ${e.message}"); return emptyList() }
 
@@ -197,36 +288,85 @@ class YoloDetector(modelPath: String, context: Context) {
         data class Raw(val box: RectF, val cls: Int, val score: Float)
         val raws = mutableListOf<Raw>()
 
-        for (a in 0 until numAnchors) {
+        for (a in 0 until 2100) {
             var bestCls = 0; var bestScore = 0f
-            for (c in 0 until 80) { val s = raw[4+c][a]; if (s > bestScore) { bestScore=s; bestCls=c } }
+            for (c in 0 until 80) {
+                val s = raw[4 + c][a]; if (s > bestScore) { bestScore = s; bestCls = c }
+            }
             if (bestScore < SCORE_MINIMO) continue
-            val cx=raw[0][a]; val cy=raw[1][a]; val w=raw[2][a]; val h=raw[3][a]
+            val cx = raw[0][a]; val cy = raw[1][a]
+            val w  = raw[2][a]; val h  = raw[3][a]
             val box = RectF(
-                (cx-w/2f).coerceIn(0f,1f),(cy-h/2f).coerceIn(0f,1f),
-                (cx+w/2f).coerceIn(0f,1f),(cy+h/2f).coerceIn(0f,1f)
+                (cx - w / 2f).coerceIn(0f, 1f), (cy - h / 2f).coerceIn(0f, 1f),
+                (cx + w / 2f).coerceIn(0f, 1f), (cy + h / 2f).coerceIn(0f, 1f)
             )
-            if (box.width()>0f && box.height()>0f) raws.add(Raw(box, bestCls, bestScore))
+            if (box.width() > 0f && box.height() > 0f) raws.add(Raw(box, bestCls, bestScore))
         }
 
         raws.sortByDescending { it.score }
         val kept = BooleanArray(raws.size) { true }
-        for (i in raws.indices) { if (!kept[i]) continue
-            for (j in i+1 until raws.size) { if (!kept[j]) continue
-                if (raws[i].cls==raws[j].cls && iou(raws[i].box,raws[j].box)>NMS_IOU_THRESH) kept[j]=false
+        for (i in raws.indices) {
+            if (!kept[i]) continue
+            for (j in i + 1 until raws.size) {
+                if (!kept[j]) continue
+                if (raws[i].cls == raws[j].cls && iou(raws[i].box, raws[j].box) > NMS_IOU_THRESH)
+                    kept[j] = false
             }
         }
         return raws.indices.filter { kept[it] }.take(MAX_DETECCIONES)
-            .map { Detection(raws[it].box, COCO_LABELS.getOrElse(raws[it].cls){"objeto"}, raws[it].score) }
+            .map { Detection(raws[it].box, COCO_LABELS.getOrElse(raws[it].cls) { "objeto" }, raws[it].score) }
     }
 
     private fun iou(a: RectF, b: RectF): Float {
-        val il=maxOf(a.left,b.left); val it=maxOf(a.top,b.top)
-        val ir=minOf(a.right,b.right); val ib=minOf(a.bottom,b.bottom)
-        if (ir<=il||ib<=it) return 0f
-        val inter=(ir-il)*(ib-it)
-        return inter/(a.width()*a.height()+b.width()*b.height()-inter)
+        val il = maxOf(a.left, b.left); val it = maxOf(a.top, b.top)
+        val ir = minOf(a.right, b.right); val ib = minOf(a.bottom, b.bottom)
+        if (ir <= il || ib <= it) return 0f
+        val inter = (ir - il) * (ib - it)
+        return inter / (a.width() * a.height() + b.width() * b.height() - inter)
     }
+
+    fun close() = interpreter?.close()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEPTH ESTIMATOR — MiDaS CPU
+// ─────────────────────────────────────────────────────────────────────────────
+class DepthEstimator(context: Context) {
+    private val SZ = 256
+    private var interpreter: Interpreter? = null
+
+    init {
+        try {
+            val fd  = context.assets.openFd(MODELO_DEPTH)
+            val buf = FileInputStream(fd.fileDescriptor).channel
+                .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+            interpreter = Interpreter(buf, Interpreter.Options().apply { numThreads = 2 })
+            Log.d(TAG, "MiDaS OK — CPU x2")
+        } catch (e: Exception) { Log.w(TAG, "MiDaS no disponible: ${e.message}") }
+    }
+
+    fun estimate(bitmap: Bitmap): Array<FloatArray>? {
+        val interp = interpreter ?: return null
+        val scaled = Bitmap.createScaledBitmap(bitmap, SZ, SZ, true)
+        val inputBuf = ByteBuffer.allocateDirect(4 * SZ * SZ * 3).order(ByteOrder.nativeOrder())
+        for (y in 0 until SZ) for (x in 0 until SZ) {
+            val px = scaled.getPixel(x, y)
+            inputBuf.putFloat(((px shr 16) and 0xFF) / 255f)
+            inputBuf.putFloat(((px shr  8) and 0xFF) / 255f)
+            inputBuf.putFloat(( px         and 0xFF) / 255f)
+        }
+        inputBuf.rewind()
+        val out = Array(1) { Array(SZ) { FloatArray(SZ) } }
+        return try {
+            interp.runForMultipleInputsOutputs(arrayOf(inputBuf), mapOf(0 to out))
+            val raw = out[0]
+            var mn = Float.MAX_VALUE; var mx = -Float.MAX_VALUE
+            for (row in raw) for (v in row) { if (v < mn) mn = v; if (v > mx) mx = v }
+            val range = (mx - mn).coerceAtLeast(1e-6f)
+            Array(SZ) { y -> FloatArray(SZ) { x -> (raw[y][x] - mn) / range } }
+        } catch (e: Exception) { Log.e(TAG, "MiDaS err: ${e.message}"); null }
+    }
+
     fun close() = interpreter?.close()
 }
 
@@ -240,36 +380,31 @@ data class ObjectTrack(
     var vx: Float = 0f, var vy: Float = 0f, var vDepth: Float = 0f,
     var framesLost: Int = 0, var framesTracked: Int = 0,
     var lastSeen: Long = 0L, var score: Float = 0f,
-    // ── NUEVO: contador de frames confirmando mismo nivel ──────────────────
-    var dangerLevel: Int = 0,
-    var dangerFrames: Int = 0  // cuántos frames consecutivos en este nivel
+    var dangerLevel: Int = 0, var dangerFrames: Int = 0
 ) {
     fun update(newBox: RectF, newDepth: Float, now: Long) {
-        val newCx=newBox.centerX(); val newCy=newBox.centerY()
-        vx     = KALMAN_SMOOTH*vx     + (1f-KALMAN_SMOOTH)*(newCx-cx)
-        vy     = KALMAN_SMOOTH*vy     + (1f-KALMAN_SMOOTH)*(newCy-cy)
-        vDepth = KALMAN_SMOOTH*vDepth + (1f-KALMAN_SMOOTH)*(newDepth-depthScore)
-        box=newBox; cx=newCx; cy=newCy; depthScore=newDepth
-        framesLost=0; framesTracked++; lastSeen=now
-
-        // Actualizar nivel de peligro y contador de confirmación
+        val newCx = newBox.centerX(); val newCy = newBox.centerY()
+        vx     = KALMAN_SMOOTH * vx     + (1f - KALMAN_SMOOTH) * (newCx - cx)
+        vy     = KALMAN_SMOOTH * vy     + (1f - KALMAN_SMOOTH) * (newCy - cy)
+        vDepth = KALMAN_SMOOTH * vDepth + (1f - KALMAN_SMOOTH) * (newDepth - depthScore)
+        box = newBox; cx = newCx; cy = newCy; depthScore = newDepth
+        framesLost = 0; framesTracked++; lastSeen = now
         val newLevel = when {
+            newDepth >= DEPTH_CRITICO -> 4
             newDepth >= DEPTH_PELIGRO -> 3
             newDepth >= DEPTH_CERCA   -> 2
             newDepth >= DEPTH_AVISO   -> 1
-            else                      -> 0
+            newDepth >= DEPTH_LEJANO  -> 0
+            else -> -1
         }
-        if (newLevel == dangerLevel) dangerFrames++
-        else { dangerLevel = newLevel; dangerFrames = 1 }
+        if (newLevel == dangerLevel) dangerFrames++ else { dangerLevel = newLevel; dangerFrames = 1 }
     }
 
-    fun predict(frames: Int): Pair<Float,Float> =
-        Pair((depthScore+vDepth*frames).coerceIn(0f,1f),(cx+vx*frames).coerceIn(0f,1f))
+    fun predict(frames: Int): Pair<Float, Float> =
+        Pair((depthScore + vDepth * frames).coerceIn(0f, 1f), (cx + vx * frames).coerceIn(0f, 1f))
 
-    val isApproaching: Boolean get() = vDepth >  MIN_VELOCITY_WARN
-    val isReceding:    Boolean get() = vDepth < -MIN_VELOCITY_WARN
+    val isApproaching: Boolean get() = vDepth > MIN_VELOCITY_WARN
     val isConfirmed:   Boolean get() = dangerFrames >= MIN_FRAMES_CONFIRMACION
-
     val zone: String get() = when {
         cx < ZONA_IZQ -> "izquierda"
         cx > ZONA_DER -> "derecha"
@@ -283,109 +418,82 @@ class TrackManager {
 
     fun update(detections: List<Detection>, depthMap: Array<FloatArray>?, now: Long): List<ObjectTrack> {
         tracks.removeIf { it.framesLost > MAX_FRAMES_PERDIDO }
-        if (detections.isEmpty()) { tracks.forEach { it.framesLost++ }; return tracks.filter { it.framesLost==0 } }
+        if (detections.isEmpty()) {
+            tracks.forEach { it.framesLost++ }; return tracks.filter { it.framesLost == 0 }
+        }
 
         data class Match(val ti: Int, val di: Int, val iou: Float)
         val candidates = mutableListOf<Match>()
-        for ((ti,t) in tracks.withIndex()) for ((di,d) in detections.withIndex()) {
-            if (d.label!=t.label) continue
-            val v=iouBoxes(t.box,d.box); if (v>=IOU_MIN_MATCH) candidates.add(Match(ti,di,v))
+        for ((ti, t) in tracks.withIndex()) for ((di, d) in detections.withIndex()) {
+            if (d.label != t.label) continue
+            val v = iouBoxes(t.box, d.box); if (v >= IOU_MIN_MATCH) candidates.add(Match(ti, di, v))
         }
         candidates.sortByDescending { it.iou }
-        val matched=BooleanArray(detections.size); val usedTrks=mutableSetOf<Int>()
+        val matched = BooleanArray(detections.size); val usedTrks = mutableSetOf<Int>()
         for (m in candidates) {
-            if (m.ti in usedTrks||matched[m.di]) continue
-            val depth=depthMap?.let { sampleDepth(it,detections[m.di].box) } ?: fallback(detections[m.di].box)
-            tracks[m.ti].update(detections[m.di].box,depth,now)
-            tracks[m.ti].score=detections[m.di].score
-            matched[m.di]=true; usedTrks.add(m.ti)
+            if (m.ti in usedTrks || matched[m.di]) continue
+            val depth = depthMap?.let { sampleDepth(it, detections[m.di].box) } ?: fallback(detections[m.di].box)
+            tracks[m.ti].update(detections[m.di].box, depth, now)
+            tracks[m.ti].score = detections[m.di].score
+            matched[m.di] = true; usedTrks.add(m.ti)
         }
-        for ((di,det) in detections.withIndex()) {
+        for ((di, det) in detections.withIndex()) {
             if (matched[di]) continue
-            val depth=depthMap?.let { sampleDepth(it,det.box) } ?: fallback(det.box)
-            tracks.add(ObjectTrack(id=nextId++,label=det.label,box=det.box,depthScore=depth,score=det.score,lastSeen=now))
+            val depth = depthMap?.let { sampleDepth(it, det.box) } ?: fallback(det.box)
+            tracks.add(ObjectTrack(id = nextId++, label = det.label, box = det.box,
+                depthScore = depth, score = det.score, lastSeen = now))
         }
-        for ((ti,t) in tracks.withIndex()) { if (ti !in usedTrks) t.framesLost++ }
-        return tracks.filter { it.framesLost==0 }
+        for ((ti, t) in tracks.withIndex()) { if (ti !in usedTrks) t.framesLost++ }
+        return tracks.filter { it.framesLost == 0 }
     }
 
     private fun iouBoxes(a: RectF, b: RectF): Float {
-        val il=maxOf(a.left,b.left); val it2=maxOf(a.top,b.top)
-        val ir=minOf(a.right,b.right); val ib=minOf(a.bottom,b.bottom)
-        if (ir<=il||ib<=it2) return 0f
-        val inter=(ir-il)*(ib-it2)
-        return inter/(a.width()*a.height()+b.width()*b.height()-inter)
+        val il = maxOf(a.left, b.left); val it2 = maxOf(a.top, b.top)
+        val ir = minOf(a.right, b.right); val ib = minOf(a.bottom, b.bottom)
+        if (ir <= il || ib <= it2) return 0f
+        val inter = (ir - il) * (ib - it2)
+        return inter / (a.width() * a.height() + b.width() * b.height() - inter)
     }
+
     private fun sampleDepth(map: Array<FloatArray>, box: RectF): Float {
-        val mh=map.size; val mw=map[0].size
-        val cx=box.centerX(); val cy=box.centerY()
-        val hw=box.width()*0.3f; val hh=box.height()*0.3f
-        val x0=((cx-hw)*mw).toInt().coerceIn(0,mw-1); val x1=((cx+hw)*mw).toInt().coerceIn(0,mw-1)
-        val y0=((cy-hh)*mh).toInt().coerceIn(0,mh-1); val y1=((cy+hh)*mh).toInt().coerceIn(0,mh-1)
-        var sum=0f; var count=0
-        for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum+=map[y][x]; count++ }
-        return if (count>0) sum/count else 0f
+        val mh = map.size; val mw = map[0].size
+        val cx = box.centerX(); val cy = box.centerY()
+        val hw = box.width() * 0.3f; val hh = box.height() * 0.3f
+        val x0 = ((cx - hw) * mw).toInt().coerceIn(0, mw - 1)
+        val x1 = ((cx + hw) * mw).toInt().coerceIn(0, mw - 1)
+        val y0 = ((cy - hh) * mh).toInt().coerceIn(0, mh - 1)
+        val y1 = ((cy + hh) * mh).toInt().coerceIn(0, mh - 1)
+        var sum = 0f; var count = 0
+        for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
+        return if (count > 0) sum / count else 0f
     }
+
     private fun fallback(box: RectF): Float {
-        val area=box.width()*box.height()
-        return when { area>=0.20f->0.85f; area>=0.08f->0.65f; area>=0.03f->0.45f; else->0.20f }
+        val area = box.width() * box.height()
+        return when { area >= 0.20f -> 0.85f; area >= 0.08f -> 0.65f; area >= 0.03f -> 0.48f; area >= 0.01f -> 0.32f; else -> 0.18f }
     }
+
+    fun allTracks(): List<ObjectTrack> = tracks.filter { it.framesLost == 0 }
     fun clear() = tracks.clear()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DEPTH ESTIMATOR — MiDaS
-// ─────────────────────────────────────────────────────────────────────────────
-class DepthEstimator(context: Context) {
-    private val SZ = 256
-    private var interpreter: Interpreter? = null
-    init {
-        try {
-            val fd=context.assets.openFd(MODELO_DEPTH)
-            val buf=FileInputStream(fd.fileDescriptor).channel.map(FileChannel.MapMode.READ_ONLY,fd.startOffset,fd.declaredLength)
-            val opts = Interpreter.Options().apply { numThreads = 2 }
-            interpreter=Interpreter(buf,opts); Log.d(TAG,"MiDaS OK")
-        } catch(e:Exception){ Log.w(TAG,"MiDaS no disponible: ${e.message}") }
-    }
-    fun estimate(bitmap: Bitmap): Array<FloatArray>? {
-        val interp=interpreter ?: return null
-        val scaled=Bitmap.createScaledBitmap(bitmap,SZ,SZ,true)
-        val inputBuf=ByteBuffer.allocateDirect(4*SZ*SZ*3).order(ByteOrder.nativeOrder())
-        for (y in 0 until SZ) for (x in 0 until SZ) {
-            val px=scaled.getPixel(x,y)
-            inputBuf.putFloat(((px shr 16) and 0xFF)/255f)
-            inputBuf.putFloat(((px shr  8) and 0xFF)/255f)
-            inputBuf.putFloat(( px         and 0xFF)/255f)
-        }
-        inputBuf.rewind()
-        val out=Array(1){Array(SZ){FloatArray(SZ)}}
-        return try {
-            interp.runForMultipleInputsOutputs(arrayOf(inputBuf),mapOf(0 to out))
-            val raw=out[0]; var mn=Float.MAX_VALUE; var mx=-Float.MAX_VALUE
-            for (row in raw) for (v in row) { if(v<mn)mn=v; if(v>mx)mx=v }
-            val range=(mx-mn).coerceAtLeast(1e-6f)
-            Array(SZ){y->FloatArray(SZ){x->(raw[y][x]-mn)/range}}
-        } catch(e:Exception){ Log.e(TAG,"MiDaS err: ${e.message}"); null }
-    }
-    fun close()=interpreter?.close()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TTS CON PRIORIDAD + VELOCIDAD DE VOZ AJUSTADA
+// TTS CON PRIORIDAD
 // ─────────────────────────────────────────────────────────────────────────────
 enum class EventPriority(val level: Int) {
-    PELIGRO_INMEDIATO(4), NAVEGACION_URGENTE(3), NAVEGACION_NORMAL(2), CONTEXTO(1), QUIETO(0)
+    CRITICO(5), PELIGRO_INMEDIATO(4), NAVEGACION_URGENTE(3), NAVEGACION_NORMAL(2), CONTEXTO(1), QUIETO(0)
 }
 
-data class NavEvent(val message: String, val priority: EventPriority, val ts: Long=System.currentTimeMillis()) : Comparable<NavEvent> {
-    override fun compareTo(other: NavEvent): Int = compareValuesBy(other,this,{it.priority.level},{it.ts})
+data class NavEvent(val message: String, val priority: EventPriority, val ts: Long = System.currentTimeMillis()) : Comparable<NavEvent> {
+    override fun compareTo(other: NavEvent): Int = compareValuesBy(other, this, { it.priority.level }, { it.ts })
 }
 
 class TtsPriorityQueue(private val tts: TextToSpeech) {
-    private val queue=PriorityQueue<NavEvent>()
-    private var lastTime=0L; private var lastPriority=EventPriority.QUIETO
+    private val queue = PriorityQueue<NavEvent>()
+    private var lastTime = 0L; private var lastPriority = EventPriority.QUIETO
 
-    private val cooldowns=mapOf(
+    private val cooldowns = mapOf(
+        EventPriority.CRITICO            to COOLDOWN_CRITICO,
         EventPriority.PELIGRO_INMEDIATO  to COOLDOWN_PELIGRO,
         EventPriority.NAVEGACION_URGENTE to COOLDOWN_NAVEGACION,
         EventPriority.NAVEGACION_NORMAL  to COOLDOWN_NAVEGACION,
@@ -394,114 +502,209 @@ class TtsPriorityQueue(private val tts: TextToSpeech) {
     )
 
     @Synchronized fun enqueue(event: NavEvent) {
-        val now=System.currentTimeMillis()
-        val cd=cooldowns[event.priority] ?: 5_000L
-        if (event.priority.level<=lastPriority.level && now-lastTime<cd) return
-        queue.removeIf { it.priority.level<event.priority.level }
+        val now = System.currentTimeMillis()
+        val cd  = cooldowns[event.priority] ?: 5_000L
+        if (event.priority.level <= lastPriority.level && now - lastTime < cd) return
+        queue.removeIf { it.priority.level < event.priority.level }
         queue.offer(event); flush()
     }
 
     @Synchronized fun flush() {
-        val event=queue.peek() ?: return
-        val interrupt=event.priority==EventPriority.PELIGRO_INMEDIATO
+        val event = queue.peek() ?: return
+        val interrupt = event.priority.level >= EventPriority.PELIGRO_INMEDIATO.level
         if (tts.isSpeaking && !interrupt) return
         queue.poll()
-        // Velocidad de habla: más rápido en peligro (1.15x), normal en contexto (0.95x)
-        val speed = when(event.priority) {
+        val speed = when (event.priority) {
+            EventPriority.CRITICO            -> 1.2f
             EventPriority.PELIGRO_INMEDIATO  -> 1.15f
             EventPriority.NAVEGACION_URGENTE -> 1.05f
-            else                             -> 0.95f
+            else -> 0.95f
         }
-        val params = Bundle().apply { putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f) }
         tts.setSpeechRate(speed)
-        tts.speak(event.message, TextToSpeech.QUEUE_FLUSH, params, "nav_${event.priority.name}_${System.currentTimeMillis()}")
-        lastTime=System.currentTimeMillis(); lastPriority=event.priority
+        tts.speak(event.message, TextToSpeech.QUEUE_FLUSH, null,
+            "nav_${event.priority.name}_${System.currentTimeMillis()}")
+        lastTime = System.currentTimeMillis(); lastPriority = event.priority
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INFERENCIA DE ESCENA
 // ─────────────────────────────────────────────────────────────────────────────
-enum class SceneType { INTERIOR_DESPEJADO, INTERIOR_CONCURRIDO, EXTERIOR_TRANQUILO, EXTERIOR_CONCURRIDO, CRUCE_PELIGROSO, DESCONOCIDO }
+enum class SceneType {
+    INTERIOR_DESPEJADO, INTERIOR_CONCURRIDO,
+    EXTERIOR_TRANQUILO, EXTERIOR_CONCURRIDO,
+    CRUCE_PELIGROSO, DESCONOCIDO
+}
 
 fun inferScene(labels: List<String>, areas: List<Float>): SceneType {
     if (labels.isEmpty()) return SceneType.DESCONOCIDO
-    val indoor=labels.count{it in INDOOR_OBJS}; val outdoor=labels.count{it in OUTDOOR_OBJS}
-    val persons=labels.count{it=="person"}; val cross=labels.count{it in CROSSING_HINTS}
-    if (cross>=2&&(labels.contains("traffic light")||labels.contains("stop sign"))) return SceneType.CRUCE_PELIGROSO
-    val isIndoor=indoor>outdoor||(indoor>0&&outdoor==0); val isOutdoor=outdoor>indoor||(outdoor>0&&indoor==0)
-    val crowded=labels.size>=5||persons>=3||areas.sum()>0.40f
+    val indoor   = labels.count { it in INDOOR_OBJS }
+    val outdoor  = labels.count { it in OUTDOOR_OBJS }
+    val persons  = labels.count { it == "person" }
+    val cross    = labels.count { it in CROSSING_HINTS }
+    if (cross >= 2 && (labels.contains("traffic light") || labels.contains("stop sign")))
+        return SceneType.CRUCE_PELIGROSO
+    val isIndoor  = indoor  > outdoor || (indoor  > 0 && outdoor == 0)
+    val isOutdoor = outdoor > indoor  || (outdoor > 0 && indoor  == 0)
+    val crowded   = labels.size >= 5 || persons >= 3 || areas.sum() > 0.35f
     return when {
-        isOutdoor&&crowded->SceneType.EXTERIOR_CONCURRIDO; isOutdoor&&!crowded->SceneType.EXTERIOR_TRANQUILO
-        isIndoor&&crowded->SceneType.INTERIOR_CONCURRIDO;  isIndoor&&!crowded->SceneType.INTERIOR_DESPEJADO
-        crowded->SceneType.INTERIOR_CONCURRIDO; else->SceneType.DESCONOCIDO
+        isOutdoor && crowded  -> SceneType.EXTERIOR_CONCURRIDO
+        isOutdoor && !crowded -> SceneType.EXTERIOR_TRANQUILO
+        isIndoor  && crowded  -> SceneType.INTERIOR_CONCURRIDO
+        isIndoor  && !crowded -> SceneType.INTERIOR_DESPEJADO
+        crowded               -> SceneType.INTERIOR_CONCURRIDO
+        else                  -> SceneType.DESCONOCIDO
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MOTOR DE NAVEGACIÓN — MENSAJES CORTOS Y DIRECTOS
+// MOTOR DE NAVEGACIÓN — Guía como acompañante humano
+//
+// REGLAS implementadas:
+//   1. SEGURIDAD primero — peligros interrumpen siempre
+//   2. BAJA LATENCIA — para objetos peligrosos no se espera confirmación de frames
+//   3. PREDICCIÓN de tendencia — acercándose sube prioridad, alejándose la baja
+//   4. ZONAS — centro > laterales con movimiento hacia el usuario
+//   5. DISTANCIA — <2m crítico | 3-4m desvío | 5-7m aviso | >7m contexto
+//   6. SALIDA — máximo 2 frases, directas, accionables
+//      Verbos: AVANZA / DETENTE / GIRA / ESQUIVA / PRECAUCIÓN
 // ─────────────────────────────────────────────────────────────────────────────
 object NavigationEngine {
-    data class NavDecision(val instruction: String, val priority: EventPriority, val vibrateMs: Long = 0L)
+    data class NavDecision(
+        val instruction: String,
+        val priority: EventPriority,
+        val vibrateMs: Long = 0L,
+        val requestScan: Boolean = false
+    )
+
+    // Objetos que NO esperan confirmación de frames si están cerca y vienen al centro
+    // Son inherentemente peligrosos y necesitan reacción inmediata
+    private val SIN_CONFIRMACION = setOf("car","truck","bus","motorcycle","bicycle","person","dog")
 
     fun decide(tracks: List<ObjectTrack>): NavDecision? {
-        if (tracks.isEmpty()) return NavDecision("Camino libre.", EventPriority.CONTEXTO)
+        if (tracks.isEmpty()) return NavDecision("Camino libre. Avanza.", EventPriority.CONTEXTO)
 
-        val reliable = tracks.filter { it.framesTracked >= 2 }
+        // Separar tracks confiables (con historia) de los de alta prioridad sin historia
+        // Los objetos peligrosos se reportan desde el primer frame si están muy cerca
+        val reliable = tracks.filter { t ->
+            t.framesTracked >= 2 || (t.label in SIN_CONFIRMACION && t.depthScore >= DEPTH_PELIGRO)
+        }
         if (reliable.isEmpty()) return null
 
-        // 1. Colisión inminente predicha — SOLO si está confirmada N frames
-        reliable.filter { it.zone=="centro" && it.isApproaching && it.isConfirmed }
-            .mapNotNull { t -> val (pd,_)=t.predict(COLLISION_FRAMES); if(pd>=DEPTH_PELIGRO) t to pd else null }
+        val center = reliable.filter { it.zone == "centro" }.maxByOrNull { it.depthScore }
+        val left   = reliable.filter { it.zone == "izquierda" }
+        val right  = reliable.filter { it.zone == "derecha" }
+        val lClear = left.none  { it.depthScore >= DEPTH_CERCA }
+        val rClear = right.none { it.depthScore >= DEPTH_CERCA }
+
+        // ── REGLA 1: CRÍTICO — <2m, acercándose, en trayectoria central ──────
+        // No espera confirmación. Interrumpe cualquier mensaje.
+        reliable.filter { it.zone == "centro" && it.isApproaching }
+            .mapNotNull { t ->
+                val (pd, _) = t.predict(COLLISION_FRAMES)
+                if (pd >= DEPTH_CRITICO) t to pd else null
+            }
             .maxByOrNull { it.second }
-            ?.let { (t,_) ->
-                val obj=shortName(t.label)
-                // Vibración larga = peligro máximo
-                return NavDecision("¡Para! $obj enfrente.", EventPriority.PELIGRO_INMEDIATO, 800L)
+            ?.let { (t, _) ->
+                val obj = shortName(t.label)
+                val dir = when {
+                    lClear -> " Esquiva a la izquierda."
+                    rClear -> " Esquiva a la derecha."
+                    else   -> " Detente ahora."
+                }
+                return NavDecision("¡Precaución! $obj al frente.$dir",
+                    EventPriority.CRITICO, 1000L)
             }
 
-        // 2. Obstáculos por profundidad
-        val center=reliable.filter{it.zone=="centro"}.maxByOrNull{it.depthScore}
-        val left  =reliable.filter{it.zone=="izquierda"}
-        val right =reliable.filter{it.zone=="derecha"}
-
-        if (center!=null && center.isConfirmed) {
-            val obj=shortName(center.label)
-            val lClear=left.none{it.depthScore>=DEPTH_CERCA}
-            val rClear=right.none{it.depthScore>=DEPTH_CERCA}
+        // ── REGLA 2: PELIGRO INMEDIATO — 2-3m en centro ──────────────────────
+        // Objeto muy cercano bloqueando el paso. Requiere acción inmediata.
+        if (center != null && center.depthScore >= DEPTH_PELIGRO) {
+            val obj = shortName(center.label)
             return when {
-                center.depthScore>=DEPTH_PELIGRO -> {
-                    val (dir, vib) = when {
-                        lClear&&!rClear -> "Gira izquierda." to 600L
-                        rClear&&!lClear -> "Gira derecha."   to 600L
-                        else            -> "¡Para!"          to 800L
-                    }
-                    NavDecision("$obj al frente. $dir", EventPriority.PELIGRO_INMEDIATO, vib)
-                }
-                center.depthScore>=DEPTH_CERCA -> {
-                    val dir=if(lClear)"izquierda" else if(rClear)"derecha" else "un lado"
-                    // Vibración corta = advertencia
-                    NavDecision("$obj adelante. Ve hacia $dir.", EventPriority.NAVEGACION_URGENTE, 300L)
-                }
-                center.depthScore>=DEPTH_AVISO ->
-                    NavDecision("Atención, $obj al frente.", EventPriority.NAVEGACION_NORMAL)
-                else -> null
+                lClear && !rClear ->
+                    NavDecision("Detente. $obj al frente. Gira a la izquierda.",
+                        EventPriority.PELIGRO_INMEDIATO, 800L)
+                rClear && !lClear ->
+                    NavDecision("Detente. $obj al frente. Gira a la derecha.",
+                        EventPriority.PELIGRO_INMEDIATO, 800L)
+                else ->
+                    // Bloqueado por ambos lados → pedir escaneo lateral
+                    NavDecision("Detente. $obj bloqueando. Mueve el teléfono a los lados.",
+                        EventPriority.PELIGRO_INMEDIATO, 800L, requestScan = true)
             }
         }
 
-        // 3. Amenaza lateral confirmada
-        (left+right).filter{it.isApproaching&&it.depthScore>=DEPTH_CERCA&&it.isConfirmed}
-            .maxByOrNull{it.depthScore}
-            ?.let { t ->
-                val obj=shortName(t.label)
-                val away=if(t.zone=="izquierda")"derecha" else "izquierda"
-                return NavDecision("$obj por ${t.zone}. Muévete a la $away.", EventPriority.NAVEGACION_URGENTE, 300L)
-            }
+        // ── REGLA 3: VEHÍCULO LATERAL ACERCÁNDOSE ─────────────────────────────
+        // Un vehículo que viene de lado puede ser más peligroso que algo estático adelante
+        val vehiculoLateral = (left + right)
+            .filter { it.label in VEHICLES && it.isApproaching && it.depthScore >= DEPTH_CERCA }
+            .maxByOrNull { it.depthScore }
 
-        return NavDecision("Camino libre.", EventPriority.CONTEXTO)
+        if (vehiculoLateral != null) {
+            val obj  = shortName(vehiculoLateral.label)
+            val away = if (vehiculoLateral.zone == "izquierda") "derecha" else "izquierda"
+            return NavDecision("¡Precaución! $obj por ${vehiculoLateral.zone}. Muévete a la $away.",
+                EventPriority.PELIGRO_INMEDIATO, 600L)
+        }
+
+        // ── REGLA 4: DESVÍO — 3-4m en centro ─────────────────────────────────
+        // Objeto cerca pero aún hay tiempo para esquivar suavemente
+        if (center != null && center.depthScore >= DEPTH_CERCA) {
+            val obj = shortName(center.label)
+            val dir = if (lClear) "izquierda" else if (rClear) "derecha" else "un lado"
+            val accion = if (center.isApproaching) "Esquiva" else "Desvíate"
+            return NavDecision("$obj adelante. $accion hacia la $dir.",
+                EventPriority.NAVEGACION_URGENTE, 300L)
+        }
+
+        // ── REGLA 5: AVISO ANTICIPADO — 5-7m ─────────────────────────────────
+        // Objeto en zona de aviso. Si se acerca, subir prioridad.
+        if (center != null && center.depthScore >= DEPTH_AVISO) {
+            val obj = shortName(center.label)
+            return if (center.isApproaching)
+                NavDecision("Precaución. $obj al frente y acercándose. Prepárate para desviar.",
+                    EventPriority.NAVEGACION_NORMAL)
+            else
+                NavDecision("Precaución. $obj al frente. Avanza con cuidado.",
+                    EventPriority.NAVEGACION_NORMAL)
+        }
+
+        // ── REGLA 6: AMENAZA LATERAL — objeto acercándose desde un lado ──────
+        val amenazaLateral = (left + right)
+            .filter { it.isApproaching && it.depthScore >= DEPTH_CERCA && it.isConfirmed }
+            .maxByOrNull { it.depthScore }
+
+        if (amenazaLateral != null) {
+            val obj  = shortName(amenazaLateral.label)
+            val away = if (amenazaLateral.zone == "izquierda") "derecha" else "izquierda"
+            return NavDecision("$obj por ${amenazaLateral.zone}. Desvíate a la $away.",
+                EventPriority.NAVEGACION_URGENTE, 300L)
+        }
+
+        // ── REGLA 7: CONTEXTO LEJANO — objetos a >7m o estáticos en laterales ─
+        // Solo para objetos de alta prioridad que vale la pena mencionar
+        val lejano = reliable
+            .filter { it.depthScore >= DEPTH_LEJANO && it.label in HIGH_PRIORITY_OBJS && !it.isApproaching }
+            .maxByOrNull { it.depthScore }
+
+        if (lejano != null) {
+            val obj = shortName(lejano.label)
+            val pos = if (lejano.zone == "centro") "al frente" else "a la ${lejano.zone}"
+            return NavDecision("$obj $pos. Continúa con precaución.",
+                EventPriority.CONTEXTO)
+        }
+
+        // ── CAMINO LIBRE ──────────────────────────────────────────────────────
+        return NavDecision("Camino libre. Avanza.", EventPriority.CONTEXTO)
     }
 
     private fun shortName(label: String): String = LABEL_ES[label]?.short ?: label
+
+    // Función auxiliar pública para que processFrame pueda consultar si hay
+    // peligro activo (para suprimir mensajes de escena durante alertas)
+    fun hayPeligroActivo(tracks: List<ObjectTrack>): Boolean =
+        tracks.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA } ||
+                tracks.any { it.isApproaching && it.depthScore >= DEPTH_PELIGRO }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +713,8 @@ object NavigationEngine {
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private lateinit var previewView: PreviewView
+    private lateinit var overlay: DetectionOverlay
+    private lateinit var scanModeLabel: TextView
     private lateinit var tts: TextToSpeech
     @Volatile private var ttsReady = false
     private lateinit var ttsQueue: TtsPriorityQueue
@@ -520,44 +725,63 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var yoloDetector: YoloDetector
     private var depthEstimator: DepthEstimator? = null
     private val depthAvailable = AtomicBoolean(false)
+    private val trackManager   = TrackManager()
 
-    private val trackManager = TrackManager()
-
+    // Flash
     private val brightHistory = ArrayDeque<Int>()
-    private var isTorchOn=false; private var lastTorchChg=0L
+    private var isTorchOn = false; private var lastTorchChg = 0L
 
+    // Sensores
     private lateinit var sensorMgr: SensorManager
-    private var accel: Sensor? = null
+    private var accel:  Sensor? = null
+    private var gyro:   Sensor? = null
     @Volatile private var lastMotionTime = System.currentTimeMillis()
 
-    private var lastSpeakTime=0L; private var lastStillTime=0L
-    private var lastSceneTime=0L; private var lastCrossTime=0L
+    // Estado de escaneo con giroscopio
+    private var scanModeActive    = false
+    private var scanStartTime     = 0L
+    private var scanStartAngle    = 0f   // ángulo inicial al pedir escaneo
+    private var scanMaxAngle      = 0f   // máximo ángulo barrido
+    private var lastScanRequest   = 0L
+    private var gyroAngleZ        = 0f   // ángulo acumulado del giroscopio
 
+    // Timestamps
+    private var lastSpeakTime   = 0L
+    private var lastStillTime   = 0L
+    private var lastSceneTime   = 0L
+    private var lastCrossTime   = 0L
+    private var lastDecisionKey = ""
+
+    // Descripción inicial del entorno
+    private var entornoDescrito = false
+    private var framesParaEntorno = 0
+
+    // Pipeline
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val depthExecutor  = Executors.newSingleThreadExecutor()
-
     @Volatile private var latestDepth: Array<FloatArray>? = null
     @Volatile private var depthTs: Long = 0L
 
-    // ── NUEVO: estado anterior para detectar cambios reales ───────────────────
-    private var lastDecisionKey = ""  // evita repetir el mismo mensaje
+    // ── Ciclo de vida ─────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        previewView = findViewById(R.id.viewFinder)
 
-        // Vibrador
+        previewView  = findViewById(R.id.viewFinder)
+        overlay      = findViewById(R.id.detectionOverlay)
+        scanModeLabel = findViewById(R.id.scanModeLabel)
+
         @Suppress("DEPRECATION")
         vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-            vm.defaultVibrator
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
             getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
         sensorMgr = getSystemService(SENSOR_SERVICE) as SensorManager
-        accel     = sensorMgr.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        accel = sensorMgr.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        gyro  = sensorMgr.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
         initModels()
         initTts()
@@ -567,88 +791,177 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 10)
     }
 
-    override fun onResume() { super.onResume(); accel?.let { sensorMgr.registerListener(this,it,SensorManager.SENSOR_DELAY_NORMAL) } }
-    override fun onPause()  { super.onPause();  sensorMgr.unregisterListener(this) }
+    override fun onResume() {
+        super.onResume()
+        accel?.let { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
+        gyro?.let  { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+    }
+    override fun onPause() { super.onPause(); sensorMgr.unregisterListener(this) }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type!=Sensor.TYPE_ACCELEROMETER) return
-        val mag=sqrt(event.values[0].pow(2)+event.values[1].pow(2)+event.values[2].pow(2))
-        if (abs(mag-SensorManager.GRAVITY_EARTH)>0.8f) lastMotionTime=System.currentTimeMillis()
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                val mag = sqrt(event.values[0].pow(2) + event.values[1].pow(2) + event.values[2].pow(2))
+                if (abs(mag - SensorManager.GRAVITY_EARTH) > 0.8f)
+                    lastMotionTime = System.currentTimeMillis()
+            }
+            Sensor.TYPE_GYROSCOPE -> {
+                // Acumular rotación en Z (yaw = girar el teléfono horizontalmente)
+                val dt = 0.02f  // ~50Hz SENSOR_DELAY_GAME
+                gyroAngleZ += Math.toDegrees(event.values[2].toDouble()).toFloat() * dt
+
+                if (scanModeActive) {
+                    val angleMoved = abs(gyroAngleZ - scanStartAngle)
+                    if (angleMoved > scanMaxAngle) scanMaxAngle = angleMoved
+
+                    // Completó el escaneo — giró suficiente
+                    if (scanMaxAngle >= SCAN_ROTATION_DEG) {
+                        completeScan()
+                    }
+                    // Timeout del escaneo
+                    if (System.currentTimeMillis() - scanStartTime > SCAN_TIMEOUT_MS) {
+                        cancelScan()
+                    }
+                }
+            }
+        }
     }
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    // ── Escaneo ───────────────────────────────────────────────────────────────
+
+    private fun startScanMode(direction: String = "ambos lados") {
+        if (System.currentTimeMillis() - lastScanRequest < SCAN_COOLDOWN) return
+        scanModeActive = true
+        scanStartTime  = System.currentTimeMillis()
+        scanStartAngle = gyroAngleZ
+        scanMaxAngle   = 0f
+        lastScanRequest = System.currentTimeMillis()
+
+        runOnUiThread { scanModeLabel.visibility = View.VISIBLE }
+        speak("Mueve el teléfono hacia $direction para ver mejor.", EventPriority.NAVEGACION_NORMAL)
+    }
+
+    private fun completeScan() {
+        scanModeActive = false
+        runOnUiThread { scanModeLabel.visibility = View.GONE }
+        // El siguiente frame de detección ya mostrará lo que vio al girar
+    }
+
+    private fun cancelScan() {
+        scanModeActive = false
+        runOnUiThread { scanModeLabel.visibility = View.GONE }
+    }
+
+    // ── Inicialización ────────────────────────────────────────────────────────
 
     private fun initModels() {
         yoloDetector = YoloDetector(MODELO_YOLO, this)
         depthExecutor.execute {
-            try { depthEstimator=DepthEstimator(this); depthAvailable.set(true) }
-            catch(e:Exception){ Log.w(TAG,"Depth no disp: ${e.message}") }
+            try { depthEstimator = DepthEstimator(this); depthAvailable.set(true) }
+            catch (e: Exception) { Log.w(TAG, "Depth no disp: ${e.message}") }
         }
     }
 
     private fun initTts() {
         tts = TextToSpeech(this) { status ->
-            if (status==TextToSpeech.SUCCESS) {
-                val r=tts.setLanguage(java.util.Locale("es","MX"))
-                if (r==TextToSpeech.LANG_MISSING_DATA||r==TextToSpeech.LANG_NOT_SUPPORTED)
+            if (status == TextToSpeech.SUCCESS) {
+                val r = tts.setLanguage(java.util.Locale("es", "MX"))
+                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)
                     tts.setLanguage(java.util.Locale("es"))
-                ttsReady=true
-                ttsQueue=TtsPriorityQueue(tts)
-                speak("Navegación activa.",EventPriority.CONTEXTO)
-            } else Log.e(TAG,"TTS falló: $status")
+                ttsReady = true
+                ttsQueue  = TtsPriorityQueue(tts)
+                speak("Iniciando sistema. Analizando entorno...", EventPriority.CONTEXTO)
+            } else Log.e(TAG, "TTS falló: $status")
         }
     }
 
+    // ── CameraX ───────────────────────────────────────────────────────────────
+
     private fun startCamera() {
-        val future=ProcessCameraProvider.getInstance(this)
+        val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
-            val provider=future.get()
-            val preview=Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            val analyzer=ImageAnalysis.Builder()
+            val provider = future.get()
+            val preview  = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+            val analyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
             analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
-                val rotation=imageProxy.imageInfo.rotationDegrees
-                val bitmap=imageProxy.toBitmap(); imageProxy.close()
-                val rotated=rotateBitmap(bitmap,rotation)
-                val now=System.currentTimeMillis()
+                val rotation = imageProxy.imageInfo.rotationDegrees
+                val bitmap   = imageProxy.toBitmap(); imageProxy.close()
+                val rotated  = rotateBitmap(bitmap, rotation)
+                val now      = System.currentTimeMillis()
 
                 controlTorch(rotated)
 
                 if (depthAvailable.get()) depthExecutor.execute {
-                    latestDepth=depthEstimator?.estimate(rotated); depthTs=System.currentTimeMillis()
+                    latestDepth = depthEstimator?.estimate(rotated)
+                    depthTs     = System.currentTimeMillis()
                 }
 
-                val detections=yoloDetector.detect(rotated)
-                val depthMap=if (now-depthTs<250L) latestDepth else null
-                processFrame(detections,depthMap,now)
+                val detections = yoloDetector.detect(rotated)
+                val depthMap   = if (now - depthTs < 250L) latestDepth else null
+
+                // Actualizar overlay visual (para demo en clase)
+                val overlayData = detections.map { d ->
+                    d.box to Pair(d.label, d.score)
+                }
+                overlay.update(overlayData, rotated.width, rotated.height)
+
+                processFrame(detections, depthMap, now)
             }
             provider.unbindAll()
-            camera=provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,preview,analyzer)
+            camera = provider.bindToLifecycle(
+                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer)
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ── Lógica principal ──────────────────────────────────────────────────────
+
     private fun processFrame(detections: List<Detection>, depthMap: Array<FloatArray>?, now: Long) {
+
         // Quietud
-        if (now-lastMotionTime>STILLNESS_MS) {
-            if (!tts.isSpeaking&&now-lastStillTime>COOLDOWN_QUIETO&&now-lastSpeakTime>COOLDOWN_POST_SPEAK) {
-                speak("En pausa. Muévete para continuar.",EventPriority.QUIETO); lastStillTime=now
+        if (now - lastMotionTime > STILLNESS_MS) {
+            if (!tts.isSpeaking && now - lastStillTime > COOLDOWN_QUIETO
+                && now - lastSpeakTime > COOLDOWN_POST_SPEAK) {
+                speak("En pausa. Muévete para continuar.", EventPriority.QUIETO)
+                lastStillTime = now
             }
             return
         }
 
-        val tracks=trackManager.update(detections,depthMap,now)
-        val labels=tracks.map{it.label}
+        val tracks = trackManager.update(detections, depthMap, now)
+        val labels = tracks.map { it.label }
 
-        checkCrossing(labels,now)
+        // ── DESCRIPCIÓN INICIAL DEL ENTORNO ───────────────────────────────────
+        // Espera 5 frames para tener detecciones estables, luego describe el entorno
+        if (!entornoDescrito) {
+            framesParaEntorno++
+            if (framesParaEntorno >= 5 && labels.isNotEmpty()) {
+                describirEntornoInicial(labels, tracks)
+                entornoDescrito = true
+            }
+            return  // No navegar hasta describir el entorno
+        }
 
-        val decision=NavigationEngine.decide(tracks) ?: return
+        checkCrossing(labels, now)
 
-        // ── FILTRO ANTI-SPAM: no repetir el mismo mensaje si nada cambió ─────
-        // La clave incluye prioridad + objeto principal para detectar cambios reales
-        val decisionKey="${decision.priority}_${decision.instruction.take(20)}"
-        val changed = decisionKey != lastDecisionKey
+        val decision = NavigationEngine.decide(tracks) ?: return
+
+        // Si pide escaneo, iniciarlo
+        if (decision.requestScan) startScanMode()
+
+        // ── FILTRO ANTI-SPAM ─────────────────────────────────────────────────
+        // Peligro alto → siempre hablar (interrumpe)
+        // Mismo mensaje repetido → respetar cooldown del TTS
+        // Contexto → solo si no hay peligro activo
+        val decisionKey    = "${decision.priority}_${decision.instruction.take(20)}"
+        val changed        = decisionKey != lastDecisionKey
         val isHighPriority = decision.priority.level >= EventPriority.NAVEGACION_URGENTE.level
+        val peligroActivo  = NavigationEngine.hayPeligroActivo(tracks)
 
         if (changed || isHighPriority) {
             speak(decision.instruction, decision.priority)
@@ -656,30 +969,75 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             lastDecisionKey = decisionKey
         }
 
-        // Escena periódica — solo si camino libre
-        if (decision.priority == EventPriority.CONTEXTO &&
-            !tts.isSpeaking && now-lastSceneTime>COOLDOWN_ESCENA) {
-            val areas=tracks.map{it.box.width()*it.box.height()}
-            val scene=inferScene(labels,areas)
-            val veh=labels.count{it in VEHICLES}; val per=labels.count{it=="person"}
-            val msg=when(scene) {
-                SceneType.INTERIOR_DESPEJADO  -> "Interior despejado."
-                SceneType.INTERIOR_CONCURRIDO -> if(per>=3)"Lugar con mucha gente." else "Espacio con objetos."
-                SceneType.EXTERIOR_TRANQUILO  -> if(veh>0)"Exterior con vehículos cerca." else "Exterior abierto."
-                SceneType.EXTERIOR_CONCURRIDO -> "Exterior concurrido."
-                SceneType.CRUCE_PELIGROSO     -> "Zona de cruce. Precaución."
-                SceneType.DESCONOCIDO         -> return
-            }
-            speak(msg,EventPriority.CONTEXTO); lastSceneTime=now
+        // Descripción periódica del entorno — SOLO si no hay peligro activo
+        if (!peligroActivo && decision.priority == EventPriority.CONTEXTO
+            && !tts.isSpeaking && now - lastSceneTime > COOLDOWN_ESCENA) {
+            val areas = tracks.map { it.box.width() * it.box.height() }
+            val scene = inferScene(labels, areas)
+            val msg   = buildSceneMessage(scene, labels)
+            if (msg != null) { speak(msg, EventPriority.CONTEXTO); lastSceneTime = now }
+        }
+    }
+
+    /**
+     * Primera descripción del entorno al arrancar.
+     * Responde: ¿Dónde estoy? ¿Hay espacio? ¿Qué hay cerca?
+     */
+    private fun describirEntornoInicial(labels: List<String>, tracks: List<ObjectTrack>) {
+        val areas = tracks.map { it.box.width() * it.box.height() }
+        val scene = inferScene(labels, areas)
+        val veh   = labels.count { it in VEHICLES }
+        val per   = labels.count { it == "person" }
+        val totalObjs = labels.size
+
+        val entorno = when (scene) {
+            SceneType.INTERIOR_DESPEJADO  -> "Pareces estar en un lugar cerrado con espacio disponible."
+            SceneType.INTERIOR_CONCURRIDO ->
+                if (per >= 3) "Estás en un lugar cerrado con $per personas cerca."
+                else "Estás en un espacio interior con varios objetos."
+            SceneType.EXTERIOR_TRANQUILO  ->
+                if (veh > 0) "Estás en exteriores. Hay $veh vehículo${if(veh>1)"s" else ""} en la zona."
+                else "Estás en exteriores con espacio abierto."
+            SceneType.EXTERIOR_CONCURRIDO -> "Estás en exteriores con mucha actividad alrededor."
+            SceneType.CRUCE_PELIGROSO     -> "Detecté una intersección o cruce. Precaución extrema."
+            SceneType.DESCONOCIDO         ->
+                if (totalObjs == 0) "No detecto objetos cercanos. El camino parece libre."
+                else "Analizando el entorno. Detecto $totalObjs objeto${if(totalObjs>1)"s" else ""}."
+        }
+
+        // Agregar objetos más cercanos
+        val masUrgente = tracks.filter { it.depthScore >= DEPTH_AVISO }
+            .maxByOrNull { it.depthScore }
+        val sufijo = if (masUrgente != null) {
+            val obj = LABEL_ES[masUrgente.label]?.short ?: masUrgente.label
+            " Hay ${LABEL_ES[masUrgente.label]?.let { "${it.art} $obj" } ?: obj} al ${masUrgente.zone}."
+        } else ""
+
+        speak("$entorno$sufijo", EventPriority.CONTEXTO)
+        lastSceneTime = System.currentTimeMillis()
+    }
+
+    private fun buildSceneMessage(scene: SceneType, labels: List<String>): String? {
+        val veh = labels.count { it in VEHICLES }
+        val per = labels.count { it == "person" }
+        return when (scene) {
+            SceneType.INTERIOR_DESPEJADO  -> "Interior despejado."
+            SceneType.INTERIOR_CONCURRIDO -> if (per >= 3) "Lugar con mucha gente." else "Espacio con objetos."
+            SceneType.EXTERIOR_TRANQUILO  -> if (veh > 0) "Exterior, $veh vehículo${if(veh>1)"s" else ""} cerca." else "Exterior abierto."
+            SceneType.EXTERIOR_CONCURRIDO -> "Exterior concurrido. Mantente alerta."
+            SceneType.CRUCE_PELIGROSO     -> "Zona de cruce. Precaución."
+            SceneType.DESCONOCIDO         -> null
         }
     }
 
     private fun checkCrossing(labels: List<String>, now: Long) {
-        if (now-lastCrossTime<COOLDOWN_CRUCE) return
-        if ((labels.contains("traffic light")||labels.contains("stop sign"))
-            && labels.count{it in CROSSING_HINTS}>=2) {
-            speak("Cruce detectado. Detente.",EventPriority.NAVEGACION_URGENTE)
-            vibrate(500L); lastCrossTime=now
+        if (now - lastCrossTime < COOLDOWN_CRUCE) return
+        if ((labels.contains("traffic light") || labels.contains("stop sign"))
+            && labels.count { it in CROSSING_HINTS } >= 2) {
+            speak("Cruce detectado. Detente y escanea los lados.", EventPriority.NAVEGACION_URGENTE)
+            vibrate(500L)
+            startScanMode("la izquierda y luego la derecha")
+            lastCrossTime = now
         }
     }
 
@@ -693,44 +1051,50 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // ── Flash ─────────────────────────────────────────────────────────────────
     private fun controlTorch(bitmap: Bitmap) {
         brightHistory.addLast(calcBrightness(bitmap))
-        if (brightHistory.size>BRIGHT_SAMPLES) brightHistory.removeFirst()
-        if (brightHistory.size<BRIGHT_SAMPLES) return
-        val avg=brightHistory.average().toInt(); val now=System.currentTimeMillis()
-        if (now-lastTorchChg<TORCH_DEBOUNCE) return
+        if (brightHistory.size > BRIGHT_SAMPLES) brightHistory.removeFirst()
+        if (brightHistory.size < BRIGHT_SAMPLES) return
+        val avg = brightHistory.average().toInt()
+        val now = System.currentTimeMillis()
+        if (now - lastTorchChg < TORCH_DEBOUNCE) return
         when {
-            avg<DARK_THRESHOLD&&!isTorchOn  -> { camera?.cameraControl?.enableTorch(true);  isTorchOn=true;  lastTorchChg=now; brightHistory.clear() }
-            avg>TORCH_OFF_THRESH&&isTorchOn -> { camera?.cameraControl?.enableTorch(false); isTorchOn=false; lastTorchChg=now; brightHistory.clear() }
+            avg < DARK_THRESHOLD  && !isTorchOn -> { camera?.cameraControl?.enableTorch(true);  isTorchOn = true;  lastTorchChg = now; brightHistory.clear() }
+            avg > TORCH_OFF_THRESH && isTorchOn -> { camera?.cameraControl?.enableTorch(false); isTorchOn = false; lastTorchChg = now; brightHistory.clear() }
         }
     }
+
     private fun calcBrightness(bitmap: Bitmap): Int {
-        var total=0L; var count=0
+        var total = 0L; var count = 0
         for (x in 0 until bitmap.width step 20) for (y in 0 until bitmap.height step 20) {
-            val p=bitmap.getPixel(x,y)
-            total+=(0.299*((p shr 16)and 0xFF)+0.587*((p shr 8)and 0xFF)+0.114*(p and 0xFF)).toLong(); count++
+            val p = bitmap.getPixel(x, y)
+            total += (0.299 * ((p shr 16) and 0xFF) + 0.587 * ((p shr 8) and 0xFF) + 0.114 * (p and 0xFF)).toLong()
+            count++
         }
-        return if(count>0)(total/count).toInt() else 128
+        return if (count > 0) (total / count).toInt() else 128
     }
 
     private fun rotateBitmap(bmp: Bitmap, deg: Int): Bitmap {
-        if (deg==0) return bmp
-        val m=Matrix(); m.postRotate(deg.toFloat())
-        return Bitmap.createBitmap(bmp,0,0,bmp.width,bmp.height,m,true)
+        if (deg == 0) return bmp
+        val m = Matrix(); m.postRotate(deg.toFloat())
+        return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
     }
 
-    private fun speak(text: String, priority: EventPriority=EventPriority.NAVEGACION_NORMAL) {
+    private fun speak(text: String, priority: EventPriority = EventPriority.NAVEGACION_NORMAL) {
         if (!ttsReady) return
-        ttsQueue.enqueue(NavEvent(text,priority)); lastSpeakTime=System.currentTimeMillis()
+        ttsQueue.enqueue(NavEvent(text, priority))
+        lastSpeakTime = System.currentTimeMillis()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode,permissions,grantResults)
-        if (requestCode==10&&grantResults.isNotEmpty()&&grantResults[0]==PackageManager.PERMISSION_GRANTED) startCamera() else finish()
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 10 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED)
+            startCamera() else finish()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         if (::tts.isInitialized) tts.shutdown()
         yoloDetector.close(); depthEstimator?.close()
-        cameraExecutor.shutdown(); depthExecutor.shutdown(); trackManager.clear()
+        cameraExecutor.shutdown(); depthExecutor.shutdown()
+        trackManager.clear()
     }
 }
