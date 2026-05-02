@@ -114,6 +114,18 @@ internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","b
 // Objetos peligrosos a cualquier distancia (avisar aunque estén lejos)
 internal val HIGH_PRIORITY_OBJS = setOf("car","truck","bus","motorcycle","bicycle","person","dog","stairs")
 
+// Objetos que NUNCA deben generar instrucciones de evasión o peligro.
+// Solo se mencionan como contexto (muy lejos, o si se pregunta). Nunca activan alarma.
+internal val SAFE_OBJECTS = setOf(
+    "couch", "chair", "dining table", "bed", "tv", "laptop",
+    "potted plant", "clock", "vase", "bottle", "cup", "sink",
+    "refrigerator", "microwave", "oven", "toaster", "cell phone",
+    "backpack", "umbrella", "handbag", "suitcase", "book",
+    "wine glass", "fork", "knife", "spoon", "bowl", "banana",
+    "apple", "sandwich", "orange", "donut", "cake", "remote",
+    "keyboard", "mouse", "scissors", "teddy bear", "hair drier", "toothbrush"
+)
+
 internal data class LabelEs(val art: String, val noun: String, val short: String)
 internal val LABEL_ES = mapOf(
     "person"        to LabelEs("una","persona","persona"),
@@ -433,14 +445,14 @@ class TrackManager {
         val matched = BooleanArray(detections.size); val usedTrks = mutableSetOf<Int>()
         for (m in candidates) {
             if (m.ti in usedTrks || matched[m.di]) continue
-            val depth = depthMap?.let { sampleDepth(it, detections[m.di].box) } ?: fallback(detections[m.di].box)
+            val depth = depthMap?.let { sampleDepth(it, detections[m.di].box) } ?: fallback(detections[m.di].box, detections[m.di].label)
             tracks[m.ti].update(detections[m.di].box, depth, now)
             tracks[m.ti].score = detections[m.di].score
             matched[m.di] = true; usedTrks.add(m.ti)
         }
         for ((di, det) in detections.withIndex()) {
             if (matched[di]) continue
-            val depth = depthMap?.let { sampleDepth(it, det.box) } ?: fallback(det.box)
+            val depth = depthMap?.let { sampleDepth(it, det.box) } ?: fallback(det.box, det.label)
             tracks.add(ObjectTrack(id = nextId++, label = det.label, box = det.box,
                 depthScore = depth, score = det.score, lastSeen = now))
         }
@@ -467,26 +479,47 @@ class TrackManager {
         var sum = 0f; var count = 0
         for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
         val midasDepth = if (count > 0) sum / count else 0f
-        // Combinar MiDaS con área del bbox — objetos grandes son siempre cercanos
+        // MiDaS tiene 80% de peso — el área solo modula levemente (20%)
+        // Antes era 60/40, lo que inflaba objetos grandes aunque estuvieran lejos
         val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        return (midasDepth * 0.6f + area * 0.4f).coerceIn(0f, 1f)
+        return (midasDepth * 0.8f + area * 0.2f).coerceIn(0f, 1f)
     }
 
-    private fun fallback(box: RectF): Float {
+    private fun fallback(box: RectF, label: String = ""): Float {
+        // Primero intentar estimación métrica por altura real del objeto (más precisa)
+        val metricDepth = metricDepthFromHeight(box, label)
+        if (metricDepth != null) return metricDepth
+        // Si no hay altura típica conocida, usar área con techo conservador
         val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        // Fallback basado en área del bounding box (sin MiDaS)
-        val areaDepth = when {
-            area >= 0.20f -> 0.85f
-            area >= 0.08f -> 0.65f
-            area >= 0.03f -> 0.48f
-            area >= 0.01f -> 0.32f
-            else          -> 0.18f
-        }
-        return areaDepth
+        // El área sola NO determina cercanía — solo da una pista débil con techo bajo.
+        // Mapeo conservador: nunca supera 0.42 (DEPTH_AVISO), jamás dispara peligro falso.
+        return (area * 1.5f + 0.15f).coerceAtMost(0.42f)
     }
 
     fun allTracks(): List<ObjectTrack> = tracks.filter { it.framesLost == 0 }
     fun clear() = tracks.clear()
+
+    // Altura real típica de objetos conocidos (en metros)
+    private val TYPICAL_HEIGHT_M = mapOf(
+        "person" to 1.70f, "bicycle" to 1.10f, "car" to 1.45f, "motorcycle" to 1.20f,
+        "bus" to 3.20f, "truck" to 3.00f, "traffic light" to 1.20f, "stop sign" to 0.60f,
+        "bench" to 0.90f, "dog" to 0.50f, "chair" to 0.90f, "couch" to 0.80f,
+        "dining table" to 0.75f, "fire hydrant" to 0.60f, "parking meter" to 1.20f,
+        "train" to 3.50f, "boat" to 2.00f
+    )
+
+    // Estima distancia en metros usando la proporción del objeto en imagen.
+    // FOV vertical ~65°, distancia focal normalizada ~0.9
+    // Retorna profundidad normalizada 0..1 (1 = muy cerca, 0 = muy lejos, max 15m)
+    private fun metricDepthFromHeight(box: RectF, label: String): Float? {
+        val realH = TYPICAL_HEIGHT_M[label] ?: return null
+        val imgH  = box.height()
+        if (imgH <= 0.005f) return null
+        // distanceM = realH / (imgH * 2 * tan(32.5°)) → simplificado con constante calibrada
+        val distanceM = (realH / imgH) * 0.65f
+        // Normalizar: 0m = 1.0, 15m = 0.0
+        return (1f - (distanceM / 15f)).coerceIn(0f, 1f)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,45 +837,95 @@ class DecisionEngine {
                         && it.depthScore >= DEPTH_PELIGRO) }
         if (confirmed.isEmpty()) return null
 
+        // ── FILTRO DE OBJETOS SEGUROS ─────────────────────────────────────────
+        // Los objetos de interior (sofás, mesas, TV...) nunca activan alarma de evasión.
+        // Solo se convierten en "obstáculo genérico" si están EXTREMADAMENTE cerca (>= DEPTH_PELIGRO).
+        val actionableTracks = confirmed.filter { it.label !in SAFE_OBJECTS }
+        val safeTracks       = confirmed.filter { it.label in SAFE_OBJECTS }
+
+        // Objetos seguros que están físicamente muy cerca → obstáculo genérico sin nombre alarmante
+        val safeBlockers = safeTracks.filter { it.depthScore >= DEPTH_PELIGRO }
+
+        // Lista final para tomar decisiones: objetos peligrosos + bloqueadores genéricos
+        val tracksParaDecision = when {
+            actionableTracks.isNotEmpty() -> actionableTracks
+            safeBlockers.isNotEmpty()     ->
+                // Tratar como obstáculo genérico de nivel 2 — no gritar "sofá peligroso"
+                safeBlockers.map { it.copy(label = "obstacle") }
+            else -> return null  // solo hay muebles lejos → silencio
+        }
+
         // ── Calcular qué lados están libres ───────────────────────────────────
-        val leftTracks  = confirmed.filter { it.zone == "izquierda" }
-        val rightTracks = confirmed.filter { it.zone == "derecha"   }
+        val leftTracks  = tracksParaDecision.filter { it.zone == "izquierda" }
+        val rightTracks = tracksParaDecision.filter { it.zone == "derecha"   }
         val lClear = leftTracks.none  { it.depthScore >= DEPTH_CERCA }
         val rClear = rightTracks.none { it.depthScore >= DEPTH_CERCA }
 
         // ── Seleccionar 1 SOLO objeto principal ───────────────────────────────
         // Prioridad: mayor dangerLevel → si empatan, mayor depthScore (más cercano)
-        val mainTrack = confirmed
+        val mainTrack = tracksParaDecision
             .sortedWith(compareByDescending<ObjectTrack> { it.dangerLevel }
                 .thenByDescending { it.depthScore })
             .firstOrNull() ?: return null
 
-        val label     = LABEL_ES[mainTrack.label]?.short ?: mainTrack.label
+        // ── ANÁLISIS DEL PASILLO COMPLETO ─────────────────────────────────────
+        // La instrucción describe por dónde CAMINAR, no solo qué objeto hay
+        val centerClear = mainTrack.zone != "centro" || mainTrack.depthScore < DEPTH_CERCA
+
+        val instruccionPasillo = when {
+            // Centro bloqueado → indicar por dónde desviar
+            !centerClear -> when {
+                lClear && rClear  -> "Desvíate a la izquierda o derecha."
+                lClear && !rClear -> "Gira a la izquierda."
+                rClear && !lClear -> "Gira a la derecha."
+                else              -> "Detente. Busca otro camino."  // activará escaneo
+            }
+            // Centro libre pero laterales ocupados → informar y seguir por centro
+            else -> {
+                val advertencias = mutableListOf<String>()
+                if (!lClear) advertencias.add("objeto a la izquierda")
+                if (!rClear) advertencias.add("objeto a la derecha")
+                if (advertencias.isNotEmpty())
+                    "${advertencias.joinToString(", ")}. Sigue por el centro."
+                else
+                    "Camino libre. Avanza."
+            }
+        }
+
+        val label     = if (mainTrack.label == "obstacle") "obstáculo"
+        else LABEL_ES[mainTrack.label]?.short ?: mainTrack.label
         val zone      = mainTrack.zone
         val danger    = mainTrack.dangerLevel
         val steps     = depthToSteps(mainTrack.depthScore)
-        val avoidance = getAvoidance(zone, lClear, rClear)
 
         // ── Construir mensaje según nivel de peligro ──────────────────────────
+        val requestScan = !centerClear && !lClear && !rClear
+
         val (msg, priority, vibrateMs) = when {
             danger >= 4 -> Triple(
-                "¡Detente! $label muy cerca al $zone. $avoidance ahora.",
+                "¡Detente! $label muy cerca. ${if(!centerClear) instruccionPasillo else ""}".trim(),
                 EventPriority.CRITICO, 1000L
             )
             danger >= 3 -> Triple(
-                "Detente. $label al $zone a $steps paso${if(steps>1)"s" else ""}. ${avoidance.replaceFirstChar { it.uppercaseChar() }}.",
+                if (!centerClear)
+                    "Detente. $label al $zone a $steps paso${if(steps>1)"s" else ""}. $instruccionPasillo"
+                else
+                    instruccionPasillo,
                 EventPriority.PELIGRO_INMEDIATO, 700L
             )
             danger >= 2 -> Triple(
-                "$label al $zone, a $steps pasos. ${avoidance.replaceFirstChar { it.uppercaseChar() }}.",
+                if (!centerClear)
+                    "$label al $zone, a $steps pasos. $instruccionPasillo"
+                else
+                    instruccionPasillo,
                 EventPriority.NAVEGACION_URGENTE, 300L
             )
             danger >= 1 -> Triple(
-                "$label al $zone, a $steps pasos.",
+                instruccionPasillo,
                 EventPriority.NAVEGACION_NORMAL, 0L
             )
             else -> Triple(
-                "$label al $zone.",
+                instruccionPasillo,
                 EventPriority.CONTEXTO, 0L
             )
         }
@@ -853,7 +936,7 @@ class DecisionEngine {
             label      = label,
             zone       = zone,
             dangerLevel = danger,
-            action     = avoidance,
+            action     = instruccionPasillo,
             timestamp  = now
         )
 
@@ -879,7 +962,7 @@ class DecisionEngine {
         lastEvent     = newEvent
         lastSpeakTime = now
 
-        return SpeakDecision(msg, priority, vibrateMs)
+        return SpeakDecision(msg, priority, vibrateMs, requestScan)
     }
 
     fun reset() {
@@ -887,7 +970,6 @@ class DecisionEngine {
         lastSpeakTime = 0L
     }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ACTIVITY
