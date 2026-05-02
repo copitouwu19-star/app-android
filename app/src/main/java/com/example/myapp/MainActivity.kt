@@ -84,6 +84,7 @@ internal const val SCAN_TRIGGER_DEPTH   = 0.70f   // si hay peligro y no se ve b
 internal const val SCAN_ROTATION_DEG    = 15f     // grados de rotación para considerar que escaneó
 internal const val SCAN_COOLDOWN        = 15_000L // cada 15s puede pedir escaneo
 internal const val SCAN_TIMEOUT_MS      = 8_000L  // 8s para completar el escaneo
+internal const val REPEAT_IF_NO_MOVE_MS = 4_500L  // repetir instrucción si usuario no se movió en 4.5s
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ETIQUETAS COCO — 80 clases
@@ -465,12 +466,23 @@ class TrackManager {
         val y1 = ((cy + hh) * mh).toInt().coerceIn(0, mh - 1)
         var sum = 0f; var count = 0
         for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
-        return if (count > 0) sum / count else 0f
+        val midasDepth = if (count > 0) sum / count else 0f
+        // Combinar MiDaS con área del bbox — objetos grandes son siempre cercanos
+        val area = (box.width() * box.height()).coerceIn(0f, 1f)
+        return (midasDepth * 0.6f + area * 0.4f).coerceIn(0f, 1f)
     }
 
     private fun fallback(box: RectF): Float {
-        val area = box.width() * box.height()
-        return when { area >= 0.20f -> 0.85f; area >= 0.08f -> 0.65f; area >= 0.03f -> 0.48f; area >= 0.01f -> 0.32f; else -> 0.18f }
+        val area = (box.width() * box.height()).coerceIn(0f, 1f)
+        // Fallback basado en área del bounding box (sin MiDaS)
+        val areaDepth = when {
+            area >= 0.20f -> 0.85f
+            area >= 0.08f -> 0.65f
+            area >= 0.03f -> 0.48f
+            area >= 0.01f -> 0.32f
+            else          -> 0.18f
+        }
+        return areaDepth
     }
 
     fun allTracks(): List<ObjectTrack> = tracks.filter { it.framesLost == 0 }
@@ -708,6 +720,176 @@ object NavigationEngine {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DECISION ENGINE — Decide CUÁNDO, QUÉ y CUÁNTAS VECES hablar
+//
+// Resuelve:
+//   • Spam de mensajes repetidos → filtro por evento anterior
+//   • Múltiples instrucciones → solo 1 objeto principal por vez
+//   • Distancia irreal → convertida a "pasos"
+//   • Sin instrucción de evasión → incluida en el mensaje
+//   • No repite si el usuario ya reaccionó → usa movimiento del acelerómetro
+// ─────────────────────────────────────────────────────────────────────────────
+class DecisionEngine {
+
+    /** Evento de navegación que representa UNA instrucción concreta */
+    data class NavigationEvent(
+        val objectId: Int,
+        val label: String,
+        val zone: String,
+        val dangerLevel: Int,
+        val action: String,     // texto ya generado de la instrucción
+        val timestamp: Long
+    )
+
+    private var lastEvent: NavigationEvent? = null
+    private var lastSpeakTime: Long = 0L
+
+    // ── Resultado que devuelve DecisionEngine.process() ───────────────────────
+    data class SpeakDecision(
+        val message: String,
+        val priority: EventPriority,
+        val vibrateMs: Long = 0L,
+        val requestScan: Boolean = false
+    )
+
+    // ── Convierte profundidad ajustada a "pasos" (UX humana) ──────────────────
+    private fun depthToSteps(depth: Float): Int = when {
+        depth >= 0.75f -> 1
+        depth >= 0.60f -> 2
+        depth >= 0.45f -> 3
+        depth >= 0.30f -> 5
+        else           -> 7
+    }
+
+    // ── Instrucción de evasión según zona y disponibilidad de caminos ─────────
+    private fun getAvoidance(zone: String, lClear: Boolean, rClear: Boolean): String = when {
+        zone == "izquierda"    -> "muévete a la derecha"
+        zone == "derecha"      -> "muévete a la izquierda"
+        lClear && !rClear      -> "gira a la izquierda"
+        rClear && !lClear      -> "gira a la derecha"
+        lClear                 -> "gira a la izquierda"
+        rClear                 -> "gira a la derecha"
+        else                   -> "detente"
+    }
+
+    // ── ¿Debo hablar ahora? — compara con el evento anterior ─────────────────
+    private fun shouldSpeak(newEvent: NavigationEvent): Boolean {
+        val last = lastEvent ?: return true
+        // Mismo objeto + misma zona + misma acción + nivel de peligro sin cambio → NO repetir
+        if (last.objectId == newEvent.objectId &&
+            last.zone == newEvent.zone &&
+            last.action == newEvent.action &&
+            kotlin.math.abs(newEvent.dangerLevel - last.dangerLevel) < 1
+        ) return false
+        return true
+    }
+
+    /**
+     * Función principal. Recibe los tracks activos y decide si hablar,
+     * qué decir y con qué prioridad.
+     *
+     * @param tracks       Lista de objetos rastreados actualmente
+     * @param lastMotionTime Timestamp del último movimiento del usuario (acelerómetro)
+     * @param now          Timestamp actual
+     */
+    fun process(
+        tracks: List<ObjectTrack>,
+        lastMotionTime: Long,
+        now: Long
+    ): SpeakDecision? {
+
+        // ── Sin tracks confiables → nada que decir ────────────────────────────
+        val confirmed = tracks.filter { it.framesTracked >= 2 ||
+                (it.label in setOf("car","truck","bus","motorcycle","bicycle","person","dog")
+                        && it.depthScore >= DEPTH_PELIGRO) }
+        if (confirmed.isEmpty()) return null
+
+        // ── Calcular qué lados están libres ───────────────────────────────────
+        val leftTracks  = confirmed.filter { it.zone == "izquierda" }
+        val rightTracks = confirmed.filter { it.zone == "derecha"   }
+        val lClear = leftTracks.none  { it.depthScore >= DEPTH_CERCA }
+        val rClear = rightTracks.none { it.depthScore >= DEPTH_CERCA }
+
+        // ── Seleccionar 1 SOLO objeto principal ───────────────────────────────
+        // Prioridad: mayor dangerLevel → si empatan, mayor depthScore (más cercano)
+        val mainTrack = confirmed
+            .sortedWith(compareByDescending<ObjectTrack> { it.dangerLevel }
+                .thenByDescending { it.depthScore })
+            .firstOrNull() ?: return null
+
+        val label     = LABEL_ES[mainTrack.label]?.short ?: mainTrack.label
+        val zone      = mainTrack.zone
+        val danger    = mainTrack.dangerLevel
+        val steps     = depthToSteps(mainTrack.depthScore)
+        val avoidance = getAvoidance(zone, lClear, rClear)
+
+        // ── Construir mensaje según nivel de peligro ──────────────────────────
+        val (msg, priority, vibrateMs) = when {
+            danger >= 4 -> Triple(
+                "¡Detente! $label muy cerca al $zone. $avoidance ahora.",
+                EventPriority.CRITICO, 1000L
+            )
+            danger >= 3 -> Triple(
+                "Detente. $label al $zone a $steps paso${if(steps>1)"s" else ""}. ${avoidance.replaceFirstChar { it.uppercaseChar() }}.",
+                EventPriority.PELIGRO_INMEDIATO, 700L
+            )
+            danger >= 2 -> Triple(
+                "$label al $zone, a $steps pasos. ${avoidance.replaceFirstChar { it.uppercaseChar() }}.",
+                EventPriority.NAVEGACION_URGENTE, 300L
+            )
+            danger >= 1 -> Triple(
+                "$label al $zone, a $steps pasos.",
+                EventPriority.NAVEGACION_NORMAL, 0L
+            )
+            else -> Triple(
+                "$label al $zone.",
+                EventPriority.CONTEXTO, 0L
+            )
+        }
+
+        // ── Construir evento para comparar con el anterior ────────────────────
+        val newEvent = NavigationEvent(
+            objectId   = mainTrack.id,
+            label      = label,
+            zone       = zone,
+            dangerLevel = danger,
+            action     = avoidance,
+            timestamp  = now
+        )
+
+        // ── Decidir si hablar ─────────────────────────────────────────────────
+        val userMoved     = (now - lastMotionTime) < 3_000L
+        val isHighDanger  = danger >= 3
+        val timeSinceLast = now - lastSpeakTime
+
+        val speak = when {
+            // Peligro crítico/inmediato → siempre interrumpe
+            isHighDanger && timeSinceLast > COOLDOWN_PELIGRO -> true
+            // Evento nuevo (objeto o instrucción cambió) → hablar
+            shouldSpeak(newEvent) -> true
+            // El usuario no se movió en X segundos → repetir la instrucción
+            !userMoved && timeSinceLast > REPEAT_IF_NO_MOVE_MS -> true
+            // Mismo evento, usuario respondió o cooldown no expiró → silencio
+            else -> false
+        }
+
+        if (!speak) return null
+
+        // ── Guardar estado y retornar ─────────────────────────────────────────
+        lastEvent     = newEvent
+        lastSpeakTime = now
+
+        return SpeakDecision(msg, priority, vibrateMs)
+    }
+
+    fun reset() {
+        lastEvent = null
+        lastSpeakTime = 0L
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MAIN ACTIVITY
 // ─────────────────────────────────────────────────────────────────────────────
 class MainActivity : AppCompatActivity(), SensorEventListener {
@@ -750,7 +932,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var lastStillTime   = 0L
     private var lastSceneTime   = 0L
     private var lastCrossTime   = 0L
-    private var lastDecisionKey = ""
+
+    // Decision Engine — cerebro de navegación
+    private val decisionEngine = DecisionEngine()
 
     // Descripción inicial del entorno
     private var entornoDescrito = false
@@ -949,28 +1133,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         checkCrossing(labels, now)
 
-        val decision = NavigationEngine.decide(tracks) ?: return
+        // ── DECISION ENGINE — única fuente de verdad para hablar ─────────────
+        // Selecciona 1 objeto principal, construye mensaje con pasos + evasión,
+        // filtra repeticiones y repite solo si el usuario no reaccionó.
+        val speakDecision = decisionEngine.process(tracks, lastMotionTime, now)
 
-        // Si pide escaneo, iniciarlo
-        if (decision.requestScan) startScanMode()
-
-        // ── FILTRO ANTI-SPAM ─────────────────────────────────────────────────
-        // Peligro alto → siempre hablar (interrumpe)
-        // Mismo mensaje repetido → respetar cooldown del TTS
-        // Contexto → solo si no hay peligro activo
-        val decisionKey    = "${decision.priority}_${decision.instruction.take(20)}"
-        val changed        = decisionKey != lastDecisionKey
-        val isHighPriority = decision.priority.level >= EventPriority.NAVEGACION_URGENTE.level
-        val peligroActivo  = NavigationEngine.hayPeligroActivo(tracks)
-
-        if (changed || isHighPriority) {
-            speak(decision.instruction, decision.priority)
-            if (decision.vibrateMs > 0) vibrate(decision.vibrateMs)
-            lastDecisionKey = decisionKey
+        if (speakDecision != null) {
+            speak(speakDecision.message, speakDecision.priority)
+            if (speakDecision.vibrateMs > 0) vibrate(speakDecision.vibrateMs)
+            if (speakDecision.requestScan) startScanMode()
+            lastSpeakTime = now
         }
 
-        // Descripción periódica del entorno — SOLO si no hay peligro activo
-        if (!peligroActivo && decision.priority == EventPriority.CONTEXTO
+        // Descripción periódica del entorno — SOLO si no hay peligro activo y
+        // el Decision Engine está en silencio
+        val peligroActivo = NavigationEngine.hayPeligroActivo(tracks)
+        if (!peligroActivo && speakDecision == null
             && !tts.isSpeaking && now - lastSceneTime > COOLDOWN_ESCENA) {
             val areas = tracks.map { it.box.width() * it.box.height() }
             val scene = inferScene(labels, areas)
