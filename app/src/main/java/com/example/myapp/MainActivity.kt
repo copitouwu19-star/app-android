@@ -445,14 +445,14 @@ class TrackManager {
         val matched = BooleanArray(detections.size); val usedTrks = mutableSetOf<Int>()
         for (m in candidates) {
             if (m.ti in usedTrks || matched[m.di]) continue
-            val depth = depthMap?.let { sampleDepth(it, detections[m.di].box) } ?: fallback(detections[m.di].box, detections[m.di].label)
+            val depth = depthMap?.let { sampleDepth(it, detections[m.di].box, detections[m.di].label) } ?: fallback(detections[m.di].box, detections[m.di].label)
             tracks[m.ti].update(detections[m.di].box, depth, now)
             tracks[m.ti].score = detections[m.di].score
             matched[m.di] = true; usedTrks.add(m.ti)
         }
         for ((di, det) in detections.withIndex()) {
             if (matched[di]) continue
-            val depth = depthMap?.let { sampleDepth(it, det.box) } ?: fallback(det.box, det.label)
+            val depth = depthMap?.let { sampleDepth(it, det.box, det.label) } ?: fallback(det.box, det.label)
             tracks.add(ObjectTrack(id = nextId++, label = det.label, box = det.box,
                 depthScore = depth, score = det.score, lastSeen = now))
         }
@@ -468,27 +468,42 @@ class TrackManager {
         return inter / (a.width() * a.height() + b.width() * b.height() - inter)
     }
 
-    private fun sampleDepth(map: Array<FloatArray>, box: RectF): Float {
+    // sampleDepth recibe también label para usar estimación métrica como ancla anti-inflación
+    private fun sampleDepth(map: Array<FloatArray>, box: RectF, label: String = ""): Float {
         val mh = map.size; val mw = map[0].size
         val cx = box.centerX(); val cy = box.centerY()
-        val hw = box.width() * 0.3f; val hh = box.height() * 0.3f
+        val hw = box.width() * 0.25f; val hh = box.height() * 0.25f
         val x0 = ((cx - hw) * mw).toInt().coerceIn(0, mw - 1)
         val x1 = ((cx + hw) * mw).toInt().coerceIn(0, mw - 1)
         val y0 = ((cy - hh) * mh).toInt().coerceIn(0, mh - 1)
         val y1 = ((cy + hh) * mh).toInt().coerceIn(0, mh - 1)
         var sum = 0f; var count = 0
         for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
-        val midasDepth = if (count > 0) sum / count else 0f
-        // MiDaS tiene 80% de peso — el área solo modula levemente (20%)
-        // Antes era 60/40, lo que inflaba objetos grandes aunque estuvieran lejos
-        val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        return (midasDepth * 0.8f + area * 0.2f).coerceIn(0f, 1f)
+        val midasRaw = if (count > 0) sum / count else 0f
+        // PROBLEMA: MiDaS en interiores asigna valores altos a TODO porque todo está
+        // relativamente cerca dentro de una habitación pequeña — infla el depthScore.
+        // SOLUCIÓN: usar estimación métrica por altura real como ancla cuando está disponible.
+        val metricAnchor = metricDepthFromHeight(box, label)
+        return if (metricAnchor != null) {
+            // 60% métrica (escala real) + 40% MiDaS (captura movimiento relativo)
+            // Si MiDaS dice "cerca" pero métricamente es lejos → la métrica lo corrige.
+            val raw = (metricAnchor * 0.6f + midasRaw * 0.4f)
+            val cap = if (label in SAFE_OBJECTS) DEPTH_PELIGRO - 0.05f else 1f
+            raw.coerceAtMost(cap).coerceIn(0f, 1f)
+        } else {
+            // Sin referencia métrica: MiDaS limitado por cap conservador de área
+            val areaCap = (box.width() * box.height() * 1.5f + 0.15f).coerceAtMost(0.45f)
+            minOf(midasRaw, areaCap + 0.20f).coerceIn(0f, 1f)
+        }
     }
 
     private fun fallback(box: RectF, label: String = ""): Float {
         // Primero intentar estimación métrica por altura real del objeto (más precisa)
         val metricDepth = metricDepthFromHeight(box, label)
-        if (metricDepth != null) return metricDepth
+        if (metricDepth != null) {
+            val cap = if (label in SAFE_OBJECTS) DEPTH_CERCA - 0.04f else 1f
+            return metricDepth.coerceAtMost(cap).coerceIn(0f, 1f)
+        }
         // Si no hay altura típica conocida, usar área con techo conservador
         val area = (box.width() * box.height()).coerceIn(0f, 1f)
         // El área sola NO determina cercanía — solo da una pista débil con techo bajo.
@@ -516,15 +531,14 @@ class TrackManager {
         val imgH  = box.height()
         if (imgH <= 0.005f) return null
         // distanceM = realH / (imgH * 2 * tan(32.5°)) → simplificado con constante calibrada
-        val distanceM = (realH / imgH) * 0.65f
+        val distanceM = realH / (imgH * 1.134f)
         // Normalizar: 0m = 1.0, 15m = 0.0
         return (1f - (distanceM / 15f)).coerceIn(0f, 1f)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // TTS CON PRIORIDAD
-// ─────────────────────────────────────────────────────────────────────────────
+
 enum class EventPriority(val level: Int) {
     CRITICO(5), PELIGRO_INMEDIATO(4), NAVEGACION_URGENTE(3), NAVEGACION_NORMAL(2), CONTEXTO(1), QUIETO(0)
 }
@@ -747,9 +761,12 @@ object NavigationEngine {
 
     // Función auxiliar pública para que processFrame pueda consultar si hay
     // peligro activo (para suprimir mensajes de escena durante alertas)
-    fun hayPeligroActivo(tracks: List<ObjectTrack>): Boolean =
-        tracks.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA } ||
-                tracks.any { it.isApproaching && it.depthScore >= DEPTH_PELIGRO }
+    fun hayPeligroActivo(tracks: List<ObjectTrack>): Boolean {
+        // IMPORTANTE: excluir SAFE_OBJECTS — un sofá no debe declarar peligro activo
+        val danger = tracks.filter { it.label !in SAFE_OBJECTS }
+        return danger.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA } ||
+                danger.any { it.isApproaching   && it.depthScore >= DEPTH_PELIGRO }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -851,7 +868,7 @@ class DecisionEngine {
             actionableTracks.isNotEmpty() -> actionableTracks
             safeBlockers.isNotEmpty()     ->
                 // Tratar como obstáculo genérico de nivel 2 — no gritar "sofá peligroso"
-                safeBlockers.map { it.copy(label = "obstacle") }
+                safeBlockers.map { it.copy(label = "obstacle", dangerLevel = minOf(it.dangerLevel, 2)) }
             else -> return null  // solo hay muebles lejos → silencio
         }
 
@@ -1169,7 +1186,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val detections = yoloDetector.detect(rotated)
-                val depthMap   = if (now - depthTs < 250L) latestDepth else null
+                val depthMap   = if (now - depthTs < 600L) latestDepth else null  // ampliado: MiDaS CPU tarda ~400ms
 
                 // Actualizar overlay visual (para demo en clase)
                 val overlayData = detections.map { d ->
@@ -1266,7 +1283,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         // Agregar objetos más cercanos
-        val masUrgente = tracks.filter { it.depthScore >= DEPTH_AVISO }
+        // Solo mencionar objetos peligrosos reales, nunca muebles/electrodomésticos
+        val masUrgente = tracks.filter { it.depthScore >= DEPTH_AVISO && it.label !in SAFE_OBJECTS }
             .maxByOrNull { it.depthScore }
         val sufijo = if (masUrgente != null) {
             val obj = LABEL_ES[masUrgente.label]?.short ?: masUrgente.label
