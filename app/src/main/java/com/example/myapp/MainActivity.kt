@@ -71,13 +71,13 @@ internal const val BRIGHT_SAMPLES   = 8
 
 // Cooldowns TTS
 internal const val COOLDOWN_CRITICO    = 1_500L  // peligro máximo: 1.5s
-internal const val COOLDOWN_PELIGRO    = 2_500L
-internal const val COOLDOWN_NAVEGACION = 3_500L
+internal const val COOLDOWN_PELIGRO    = 2_000L  // reducido a 2s para respuesta más rápida
+internal const val COOLDOWN_NAVEGACION = 2_500L  // reducido a 2.5s para instrucciones de ruta más frecuentes
 internal const val COOLDOWN_QUIETO     = 25_000L
 internal const val COOLDOWN_POST_SPEAK = 5_000L
 internal const val COOLDOWN_ESCENA     = 40_000L
 internal const val COOLDOWN_CRUCE      = 8_000L
-internal const val STILLNESS_MS        = 7_000L
+internal const val STILLNESS_MS        = 12_000L  // 12s sin movimiento → pausa (era 7s, demasiado corto caminando despacio)
 
 // Escaneo con giroscopio
 internal const val SCAN_TRIGGER_DEPTH   = 0.70f   // si hay peligro y no se ve bien → pedir escaneo
@@ -369,10 +369,12 @@ class DepthEstimator(context: Context) {
             inputBuf.putFloat(( px         and 0xFF) / 255f)
         }
         inputBuf.rewind()
-        val out = Array(1) { Array(SZ) { FloatArray(SZ) } }
+        // Shape corregido: [1, 256, 256, 1] — el modelo tiene canal extra al final
+        val out = Array(1) { Array(SZ) { Array(SZ) { FloatArray(1) } } }
         return try {
             interp.runForMultipleInputsOutputs(arrayOf(inputBuf), mapOf(0 to out))
-            val raw = out[0]
+            // Extraer canal único → convertir a Array<FloatArray> normal
+            val raw = Array(SZ) { y -> FloatArray(SZ) { x -> out[0][y][x][0] } }
             var mn = Float.MAX_VALUE; var mx = -Float.MAX_VALUE
             for (row in raw) for (v in row) { if (v < mn) mn = v; if (v > mx) mx = v }
             val range = (mx - mn).coerceAtLeast(1e-6f)
@@ -501,13 +503,12 @@ class TrackManager {
         // Primero intentar estimación métrica por altura real del objeto (más precisa)
         val metricDepth = metricDepthFromHeight(box, label)
         if (metricDepth != null) {
-            val cap = if (label in SAFE_OBJECTS) DEPTH_CERCA - 0.04f else 1f
+            // Objetos seguros: cap en DEPTH_PELIGRO - 0.05 = 0.57 (permite avisar si muy cerca, nunca gritar)
+            val cap = if (label in SAFE_OBJECTS) DEPTH_PELIGRO - 0.05f else 1f
             return metricDepth.coerceAtMost(cap).coerceIn(0f, 1f)
         }
         // Si no hay altura típica conocida, usar área con techo conservador
         val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        // El área sola NO determina cercanía — solo da una pista débil con techo bajo.
-        // Mapeo conservador: nunca supera 0.42 (DEPTH_AVISO), jamás dispara peligro falso.
         return (area * 1.5f + 0.15f).coerceAtMost(0.42f)
     }
 
@@ -530,10 +531,10 @@ class TrackManager {
         val realH = TYPICAL_HEIGHT_M[label] ?: return null
         val imgH  = box.height()
         if (imgH <= 0.005f) return null
-        // distanceM = realH / (imgH * 2 * tan(32.5°)) → simplificado con constante calibrada
         val distanceM = realH / (imgH * 1.134f)
-        // Normalizar: 0m = 1.0, 15m = 0.0
-        return (1f - (distanceM / 15f)).coerceIn(0f, 1f)
+        val depth = (1f - (distanceM / 15f)).coerceIn(0f, 1f)
+        Log.v(TAG, "METRIC $label imgH=${"%.3f".format(imgH)} dist=${"%.1f".format(distanceM)}m depth=${"%.2f".format(depth)}")
+        return depth
     }
 }
 
@@ -587,13 +588,20 @@ class TtsPriorityQueue(private val tts: TextToSpeech) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INFERENCIA DE ESCENA
+// INFERENCIA DE ESCENA — detecta tipo de habitación además de interior/exterior
 // ─────────────────────────────────────────────────────────────────────────────
 enum class SceneType {
+    COCINA, HABITACION, SALA, BANO, OFICINA,
     INTERIOR_DESPEJADO, INTERIOR_CONCURRIDO,
     EXTERIOR_TRANQUILO, EXTERIOR_CONCURRIDO,
     CRUCE_PELIGROSO, DESCONOCIDO
 }
+
+private val COCINA_HINTS    = setOf("microwave","oven","toaster","refrigerator","sink","bowl","cup","bottle","fork","knife","spoon")
+private val HABITACION_HINTS= setOf("bed","clock","teddy bear","hair drier")
+private val SALA_HINTS      = setOf("couch","tv","remote","vase","potted plant","book")
+private val BANO_HINTS      = setOf("toilet","sink","toothbrush","hair drier")
+private val OFICINA_HINTS   = setOf("laptop","keyboard","mouse","chair","clock","book","cell phone")
 
 fun inferScene(labels: List<String>, areas: List<Float>): SceneType {
     if (labels.isEmpty()) return SceneType.DESCONOCIDO
@@ -603,14 +611,32 @@ fun inferScene(labels: List<String>, areas: List<Float>): SceneType {
     val cross    = labels.count { it in CROSSING_HINTS }
     if (cross >= 2 && (labels.contains("traffic light") || labels.contains("stop sign")))
         return SceneType.CRUCE_PELIGROSO
+
     val isIndoor  = indoor  > outdoor || (indoor  > 0 && outdoor == 0)
     val isOutdoor = outdoor > indoor  || (outdoor > 0 && indoor  == 0)
     val crowded   = labels.size >= 5 || persons >= 3 || areas.sum() > 0.35f
+
+    // Detectar tipo de habitación por objetos característicos
+    if (isIndoor) {
+        val cocinaScore  = labels.count { it in COCINA_HINTS }
+        val habScore     = labels.count { it in HABITACION_HINTS }
+        val salaScore    = labels.count { it in SALA_HINTS }
+        val banoScore    = labels.count { it in BANO_HINTS }
+        val oficScore    = labels.count { it in OFICINA_HINTS }
+        val maxScore = maxOf(cocinaScore, habScore, salaScore, banoScore, oficScore)
+        if (maxScore >= 2) return when (maxScore) {
+            cocinaScore  -> SceneType.COCINA
+            habScore     -> SceneType.HABITACION
+            salaScore    -> SceneType.SALA
+            banoScore    -> SceneType.BANO
+            else         -> SceneType.OFICINA
+        }
+        return if (crowded) SceneType.INTERIOR_CONCURRIDO else SceneType.INTERIOR_DESPEJADO
+    }
+
     return when {
         isOutdoor && crowded  -> SceneType.EXTERIOR_CONCURRIDO
         isOutdoor && !crowded -> SceneType.EXTERIOR_TRANQUILO
-        isIndoor  && crowded  -> SceneType.INTERIOR_CONCURRIDO
-        isIndoor  && !crowded -> SceneType.INTERIOR_DESPEJADO
         crowded               -> SceneType.INTERIOR_CONCURRIDO
         else                  -> SceneType.DESCONOCIDO
     }
@@ -849,9 +875,15 @@ class DecisionEngine {
     ): SpeakDecision? {
 
         // ── Sin tracks confiables → nada que decir ────────────────────────────
-        val confirmed = tracks.filter { it.framesTracked >= 2 ||
-                (it.label in setOf("car","truck","bus","motorcycle","bicycle","person","dog")
-                        && it.depthScore >= DEPTH_PELIGRO) }
+        // CAMBIO: objetos con depthScore alto avisan desde el frame 1, sin esperar confirmación
+        val FAST_WARN_LABELS = setOf("car","truck","bus","motorcycle","bicycle","person","dog",
+            "chair","couch","dining table","bed","bench","toilet","potted plant")
+        val confirmed = tracks.filter {
+            it.framesTracked >= 2 ||
+                    (it.label in FAST_WARN_LABELS && it.depthScore >= DEPTH_CERCA) ||
+                    (it.depthScore >= DEPTH_PELIGRO)  // cualquier objeto muy cerca avisa de inmediato
+        }
+        Log.d(TAG, "DECISION tracks=${tracks.size} confirmed=${confirmed.size} labels=${confirmed.map{"${it.label}(d=${"%.2f".format(it.depthScore)},z=${it.zone})"}}")
         if (confirmed.isEmpty()) return null
 
         // ── FILTRO DE OBJETOS SEGUROS ─────────────────────────────────────────
@@ -869,7 +901,17 @@ class DecisionEngine {
             safeBlockers.isNotEmpty()     ->
                 // Tratar como obstáculo genérico de nivel 2 — no gritar "sofá peligroso"
                 safeBlockers.map { it.copy(label = "obstacle", dangerLevel = minOf(it.dangerLevel, 2)) }
-            else -> return null  // solo hay muebles lejos → silencio
+            else -> {
+                // Solo hay muebles lejos → silencio. NO decir "camino libre" si no hubo peligro previo
+                // (evita decirlo justo cuando ya pasaste el obstáculo)
+                val lastWasDangerous = lastEvent?.let { it.dangerLevel >= 2 } ?: false
+                val timeSinceLastSpeak = now - lastSpeakTime
+                if (lastWasDangerous && timeSinceLastSpeak < 2_000L) {
+                    Log.d(TAG, "SILENCIO: esperando 2s antes de decir camino libre")
+                    return null
+                }
+                return null
+            }
         }
 
         // ── Calcular qué lados están libres ───────────────────────────────────
@@ -975,6 +1017,8 @@ class DecisionEngine {
 
         if (!speak) return null
 
+        Log.d(TAG, "SPEAK danger=$danger zone=$zone label=$label msg='$msg'")
+
         // ── Guardar estado y retornar ─────────────────────────────────────────
         lastEvent     = newEvent
         lastSpeakTime = now
@@ -1038,6 +1082,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // Descripción inicial del entorno
     private var entornoDescrito = false
     private var framesParaEntorno = 0
+
+    private var frameCount = 0  // agregar esta variable a MainActivity
 
     // Pipeline
     private val cameraExecutor = Executors.newSingleThreadExecutor()
@@ -1180,13 +1226,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                 controlTorch(rotated)
 
-                if (depthAvailable.get()) depthExecutor.execute {
+                // DESPUÉS — MiDaS cada 3 frames
+
+                // dentro del analyzer:
+                frameCount++
+                if (depthAvailable.get() && frameCount % 3 == 0) depthExecutor.execute {
                     latestDepth = depthEstimator?.estimate(rotated)
                     depthTs     = System.currentTimeMillis()
                 }
 
+                val t0 = System.currentTimeMillis()
                 val detections = yoloDetector.detect(rotated)
-                val depthMap   = if (now - depthTs < 600L) latestDepth else null  // ampliado: MiDaS CPU tarda ~400ms
+                val yoloMs = System.currentTimeMillis() - t0
+                // MiDaS CPU tarda 300-600ms — aceptamos hasta 1200ms para no quedarnos sin depth
+                val depthAge = now - depthTs
+                val depthMap = if (depthAge < 1200L) latestDepth else null
+                Log.d(TAG, "FRAME yolo=${yoloMs}ms dets=${detections.size} depthAge=${depthAge}ms depthOk=${depthMap != null}")
 
                 // Actualizar overlay visual (para demo en clase)
                 val overlayData = detections.map { d ->
@@ -1218,6 +1273,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val tracks = trackManager.update(detections, depthMap, now)
         val labels = tracks.map { it.label }
+        Log.d(TAG, "TRACKS total=${tracks.size} labels=${labels.distinct()}")
 
         // ── DESCRIPCIÓN INICIAL DEL ENTORNO ───────────────────────────────────
         // Espera 5 frames para tener detecciones estables, luego describe el entorno
@@ -1268,6 +1324,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val totalObjs = labels.size
 
         val entorno = when (scene) {
+            SceneType.COCINA              -> "Pareces estar en una cocina."
+            SceneType.HABITACION          -> "Pareces estar en una habitación."
+            SceneType.SALA                -> "Pareces estar en una sala."
+            SceneType.BANO                -> "Pareces estar en un baño."
+            SceneType.OFICINA             -> "Pareces estar en una oficina o estudio."
             SceneType.INTERIOR_DESPEJADO  -> "Pareces estar en un lugar cerrado con espacio disponible."
             SceneType.INTERIOR_CONCURRIDO ->
                 if (per >= 3) "Estás en un lugar cerrado con $per personas cerca."
@@ -1299,8 +1360,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val veh = labels.count { it in VEHICLES }
         val per = labels.count { it == "person" }
         return when (scene) {
+            SceneType.COCINA              -> "Pareces estar en una cocina."
+            SceneType.HABITACION          -> "Pareces estar en una habitación."
+            SceneType.SALA                -> "Pareces estar en una sala."
+            SceneType.BANO                -> "Pareces estar en un baño."
+            SceneType.OFICINA             -> "Pareces estar en una oficina o estudio."
             SceneType.INTERIOR_DESPEJADO  -> "Interior despejado."
-            SceneType.INTERIOR_CONCURRIDO -> if (per >= 3) "Lugar con mucha gente." else "Espacio con objetos."
+            SceneType.INTERIOR_CONCURRIDO -> if (per >= 3) "Lugar con mucha gente." else "Espacio interior con objetos."
             SceneType.EXTERIOR_TRANQUILO  -> if (veh > 0) "Exterior, $veh vehículo${if(veh>1)"s" else ""} cerca." else "Exterior abierto."
             SceneType.EXTERIOR_CONCURRIDO -> "Exterior concurrido. Mantente alerta."
             SceneType.CRUCE_PELIGROSO     -> "Zona de cruce. Precaución."
