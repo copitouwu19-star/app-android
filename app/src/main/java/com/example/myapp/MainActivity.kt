@@ -2,6 +2,7 @@ package com.example.myapp
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.hardware.Sensor
@@ -13,6 +14,7 @@ import android.speech.tts.TextToSpeech
 import android.util.AttributeSet
 import android.util.Log
 import android.view.View
+import android.widget.ImageButton
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -21,6 +23,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -36,11 +40,11 @@ import kotlin.math.*
 // ─────────────────────────────────────────────────────────────────────────────
 internal const val TAG = "VisualNav"
 
-internal const val MODELO_YOLO  = "yolov8n_320.tflite"
+internal const val MODELO_YOLO  = "yolov8n-oiv7_float32.tflite"
 internal const val MODELO_DEPTH = "midas_v21_small_256.tflite"
 
 internal const val YOLO_INPUT_SIZE = 320
-internal const val SCORE_MINIMO    = 0.35f  // más sensible para detectar desde lejos
+internal const val SCORE_MINIMO    = 0.28f  // umbral bajo para capturar muebles en interiores con poca luz
 internal const val NMS_IOU_THRESH  = 0.45f
 internal const val MAX_DETECCIONES = 15     // más detecciones para contexto completo
 
@@ -57,15 +61,15 @@ internal const val DEPTH_LEJANO   = 0.18f  // nivel 0: mención contextual (≈7
 
 // Tracking
 internal const val IOU_MIN_MATCH           = 0.25f
-internal const val MAX_FRAMES_PERDIDO      = 6
+internal const val MAX_FRAMES_PERDIDO      = 3
 internal const val KALMAN_SMOOTH           = 0.55f
 internal const val MIN_VELOCITY_WARN       = 0.012f
 internal const val COLLISION_FRAMES        = 10
-internal const val MIN_FRAMES_CONFIRMACION = 2  // reducido para respuesta más rápida
+internal const val MIN_FRAMES_CONFIRMACION = 1
 
 // Flash
 internal const val DARK_THRESHOLD   = 55
-internal const val TORCH_OFF_THRESH = 115
+internal const val TORCH_OFF_THRESH = 150
 internal const val TORCH_DEBOUNCE   = 5_000L
 internal const val BRIGHT_SAMPLES   = 8
 
@@ -84,178 +88,435 @@ internal const val SCAN_TRIGGER_DEPTH   = 0.70f   // si hay peligro y no se ve b
 internal const val SCAN_ROTATION_DEG    = 15f     // grados de rotación para considerar que escaneó
 internal const val SCAN_COOLDOWN        = 15_000L // cada 15s puede pedir escaneo
 internal const val SCAN_TIMEOUT_MS      = 8_000L  // 8s para completar el escaneo
-internal const val REPEAT_IF_NO_MOVE_MS = 4_500L  // repetir instrucción si usuario no se movió en 4.5s
+internal const val REPEAT_IF_NO_MOVE_MS = 8_000L  // repetir instrucción si usuario no se movió en 8s
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ETIQUETAS COCO — 80 clases
 // ─────────────────────────────────────────────────────────────────────────────
-internal val COCO_LABELS = listOf(
-    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
-    "traffic light","fire hydrant","stop sign","parking meter","bench",
-    "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe",
-    "backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard",
-    "sports ball","kite","baseball bat","baseball glove","skateboard","surfboard",
-    "tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl",
-    "banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza",
-    "donut","cake","chair","couch","potted plant","bed","dining table","toilet",
-    "tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
-    "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear",
-    "hair drier","toothbrush"
+internal val OIV7_LABELS = listOf(
+    "accordion","adhesive tape","aircraft","airplane","alarm clock","alpaca","ambulance","animal",
+    "ant","antelope","apple","armadillo","artichoke","auto part","axe","backpack",
+    "bagel","baked goods","balance beam","ball","balloon","banana","band-aid","banjo",
+    "barge","barrel","baseball bat","baseball glove","bat (animal)","bathroom accessory","bathroom cabinet","bathtub",
+    "beaker","bear","bed","bee","beehive","beer","beetle","bell pepper",
+    "belt","bench","bicycle","bicycle helmet","bicycle wheel","bidet","billboard","billiard table",
+    "binoculars","bird","blender","blue jay","boat","bomb","book","bookcase",
+    "boot","bottle","bottle opener","bow and arrow","bowl","bowling equipment","box","boy",
+    "brassiere","bread","briefcase","broccoli","bronze sculpture","brown bear","building","bull",
+    "burrito","bus","bust","butterfly","cabbage","cabinetry","cake","cake stand",
+    "calculator","camel","camera","can opener","canary","candle","candy","cannon",
+    "canoe","cantaloupe","car","carnivore","carrot","cart","cassette deck","castle",
+    "cat","cat furniture","caterpillar","cattle","ceiling fan","cello","centipede","chainsaw",
+    "chair","cheese","cheetah","chest of drawers","chicken","chime","chisel","chopsticks",
+    "christmas tree","clock","closet","clothing","coat","cocktail","cocktail shaker","coconut",
+    "coffee","coffee cup","coffee table","coffeemaker","coin","common fig","common sunflower","computer keyboard",
+    "computer monitor","computer mouse","container","convenience store","cookie","cooking spray","corded phone","cosmetics",
+    "couch","countertop","cowboy hat","crab","cream","cricket ball","crocodile","croissant",
+    "crown","crutch","cucumber","cupboard","curtain","cutting board","dagger","dairy product",
+    "deer","desk","dessert","diaper","dice","digital clock","dinosaur","dishwasher",
+    "dog","dog bed","doll","dolphin","door","door handle","doughnut","dragonfly",
+    "drawer","dress","drill (tool)","drink","drinking straw","drum","duck","dumbbell",
+    "eagle","earrings","egg (food)","elephant","envelope","eraser","face powder","facial tissue holder",
+    "falcon","fashion accessory","fast food","fax","fedora","filing cabinet","fire hydrant","fireplace",
+    "fish","flag","flashlight","flower","flowerpot","flute","flying disc","food",
+    "food processor","football","football helmet","footwear","fork","fountain","fox","french fries",
+    "french horn","frog","fruit","frying pan","furniture","garden asparagus","gas stove","giraffe",
+    "girl","glasses","glove","goat","goggles","goldfish","golf ball","golf cart",
+    "gondola","goose","grape","grapefruit","grinder","guacamole","guitar","hair dryer",
+    "hair spray","hamburger","hammer","hamster","hand dryer","handbag","handgun","harbor seal",
+    "harmonica","harp","harpsichord","hat","headphones","heater","hedgehog","helicopter",
+    "helmet","high heels","hiking equipment","hippopotamus","home appliance","honeycomb","horizontal bar","horse",
+    "hot dog","house","houseplant","human arm","human beard","human body","human ear","human eye",
+    "human face","human foot","human hair","human hand","human head","human leg","human mouth","human nose",
+    "humidifier","ice cream","indoor rower","infant bed","insect","invertebrate","ipod","isopod",
+    "jacket","jacuzzi","jaguar (animal)","jeans","jellyfish","jet ski","jug","juice",
+    "kangaroo","kettle","kitchen & dining room table","kitchen appliance","kitchen knife","kitchen utensil","kitchenware","kite",
+    "knife","koala","ladder","ladle","ladybug","lamp","land vehicle","lantern",
+    "laptop","lavender (plant)","lemon","leopard","light bulb","light switch","lighthouse","lily",
+    "limousine","lion","lipstick","lizard","lobster","loveseat","luggage and bags","lynx",
+    "magpie","mammal","man","mango","maple","maracas","marine invertebrates","marine mammal",
+    "measuring cup","mechanical fan","medical equipment","microphone","microwave oven","milk","miniskirt","mirror",
+    "missile","mixer","mixing bowl","mobile phone","monkey","moths and butterflies","motorcycle","mouse",
+    "muffin","mug","mule","mushroom","musical instrument","musical keyboard","nail (construction)","necklace",
+    "nightstand","oboe","office building","office supplies","orange","organ (musical instrument)","ostrich","otter",
+    "oven","owl","oyster","paddle","palm tree","pancake","panda","paper cutter",
+    "paper towel","parachute","parking meter","parrot","pasta","pastry","peach","pear",
+    "pen","pencil case","pencil sharpener","penguin","perfume","person","personal care","personal flotation device",
+    "piano","picnic basket","picture frame","pig","pillow","pineapple","pitcher (container)","pizza",
+    "pizza cutter","plant","plastic bag","plate","platter","plumbing fixture","polar bear","pomegranate",
+    "popcorn","porch","porcupine","poster","potato","power plugs and sockets","pressure cooker","pretzel",
+    "printer","pumpkin","punching bag","rabbit","raccoon","racket","radish","ratchet (device)",
+    "raven","rays and skates","red panda","refrigerator","remote control","reptile","rhinoceros","rifle",
+    "ring binder","rocket","roller skates","rose","rugby ball","ruler","salad","salt and pepper shakers",
+    "sandal","sandwich","saucer","saxophone","scale","scarf","scissors","scoreboard",
+    "scorpion","screwdriver","sculpture","sea lion","sea turtle","seafood","seahorse","seat belt",
+    "segway","serving tray","sewing machine","shark","sheep","shelf","shellfish","shirt",
+    "shorts","shotgun","shower","shrimp","sink","skateboard","ski","skirt",
+    "skull","skunk","skyscraper","slow cooker","snack","snail","snake","snowboard",
+    "snowman","snowmobile","snowplow","soap dispenser","sock","sofa bed","sombrero","sparrow",
+    "spatula","spice rack","spider","spoon","sports equipment","sports uniform","squash (plant)","squid",
+    "squirrel","stairs","stapler","starfish","stationary bicycle","stethoscope","stool","stop sign",
+    "strawberry","street light","stretcher","studio couch","submarine","submarine sandwich","suit","suitcase",
+    "sun hat","sunglasses","surfboard","sushi","swan","swim cap","swimming pool","swimwear",
+    "sword","syringe","table","table tennis racket","tablet computer","tableware","taco","tank",
+    "tap","tart","taxi","tea","teapot","teddy bear","telephone","television",
+    "tennis ball","tennis racket","tent","tiara","tick","tie","tiger","tin can",
+    "tire","toaster","toilet","toilet paper","tomato","tool","toothbrush","torch",
+    "tortoise","towel","tower","toy","traffic light","traffic sign","train","training bench",
+    "treadmill","tree","tree house","tripod","trombone","trousers","truck","trumpet",
+    "turkey","turtle","umbrella","unicycle","van","vase","vegetable","vehicle",
+    "vehicle registration plate","violin","volleyball (ball)","waffle","waffle iron","wall clock","wardrobe","washing machine",
+    "waste container","watch","watercraft","watermelon","weapon","whale","wheel","wheelchair",
+    "whisk","whiteboard","willow","window","window blind","wine","wine glass","wine rack",
+    "winter melon","wok","woman","wood-burning stove","woodpecker","worm","wrench","zebra",
+    "zucchini"
 )
 
-internal val VEHICLES       = setOf("bicycle","car","motorcycle","bus","train","truck","boat")
-internal val ANIMALS        = setOf("bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe")
-internal val INDOOR_OBJS    = setOf("chair","couch","bed","dining table","toilet","tv","laptop",
-    "sink","refrigerator","potted plant","clock","cup","bottle","cell phone","microwave","oven","toaster","book")
+internal val VEHICLES       = setOf("bicycle","car","motorcycle","bus","train","truck","boat","van","taxi","ambulance")
+internal val ANIMALS        = setOf("bird","cat","dog","horse","cattle","elephant","bear","brown bear",
+    "zebra","giraffe","lion","tiger","leopard","cheetah","jaguar (animal)","crocodile","deer","shark")
+internal val INDOOR_OBJS    = setOf("chair","couch","bed","kitchen & dining room table","toilet","television","laptop",
+    "sink","refrigerator","houseplant","clock","coffee cup","mug","bottle","mobile phone","microwave oven",
+    "oven","toaster","book","chest of drawers","nightstand","wardrobe","bookcase","desk",
+    "coffee table","dishwasher","mirror","shelf","cupboard","bathroom cabinet","cabinetry",
+    "fireplace","lamp","pillow","digital clock","wall clock","computer monitor","computer keyboard",
+    "washing machine","infant bed","loveseat","sofa bed","stool","waste container","curtain")
 internal val OUTDOOR_OBJS   = setOf("car","truck","bus","motorcycle","bicycle",
-    "traffic light","stop sign","fire hydrant","bench","train","boat","parking meter")
-internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","bus","bicycle","motorcycle")
+    "traffic light","stop sign","fire hydrant","bench","train","boat","parking meter",
+    "van","taxi","ambulance","traffic sign","billboard","street light",
+    // Fuertes indicadores de exterior — corrige detección de calle/patio como "interior"
+    "house","building","office building","skyscraper","tower","porch",
+    "tree","palm tree","fence","gate","road","traffic cone")
+internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","bus","bicycle","motorcycle","van","taxi")
 
 // Objetos peligrosos a cualquier distancia (avisar aunque estén lejos)
-internal val HIGH_PRIORITY_OBJS = setOf("car","truck","bus","motorcycle","bicycle","person","dog","stairs")
+internal val HIGH_PRIORITY_OBJS = setOf(
+    "car","truck","bus","motorcycle","bicycle","person","man","woman","boy","girl",
+    "dog","cat","stairs","door","ladder","van","taxi","ambulance","train","boat"
+)
 
 // Objetos que NUNCA deben generar instrucciones de evasión o peligro.
-// Solo se mencionan como contexto (muy lejos, o si se pregunta). Nunca activan alarma.
 internal val SAFE_OBJECTS = setOf(
-    "couch", "chair", "dining table", "bed", "tv", "laptop",
-    "potted plant", "clock", "vase", "bottle", "cup", "sink",
-    "refrigerator", "microwave", "oven", "toaster", "cell phone",
-    "backpack", "umbrella", "handbag", "suitcase", "book",
-    "wine glass", "fork", "knife", "spoon", "bowl", "banana",
-    "apple", "sandwich", "orange", "donut", "cake", "remote",
-    "keyboard", "mouse", "scissors", "teddy bear", "hair drier", "toothbrush"
+    "fork","knife","spoon","banana","apple","sandwich","orange","doughnut","cake",
+    "scissors","toothbrush","food","snack","baked goods","fast food","dessert",
+    "fruit","vegetable","cookie","candy","pizza","pasta","bread","salad",
+    // Ropa y partes del cuerpo: no son obstáculos de navegación
+    "clothing","fashion accessory","footwear","coat","jacket","dress","shirt",
+    "jeans","shorts","hat","sunglasses","glasses","suit","brassiere","glove","sock",
+    "human face","human hair","human hand","human arm","human leg","human body",
+    "human eye","human ear","human nose","human mouth","human head","human foot"
 )
 
 internal data class LabelEs(val art: String, val noun: String, val short: String)
 internal val LABEL_ES = mapOf(
-    "person"        to LabelEs("una","persona","persona"),
-    "bicycle"       to LabelEs("una","bicicleta","bici"),
-    "car"           to LabelEs("un","automóvil","auto"),
-    "motorcycle"    to LabelEs("una","motocicleta","moto"),
-    "airplane"      to LabelEs("un","avión","avión"),
-    "bus"           to LabelEs("un","autobús","autobús"),
-    "train"         to LabelEs("un","tren","tren"),
-    "truck"         to LabelEs("un","camión","camión"),
-    "boat"          to LabelEs("un","bote","bote"),
-    "traffic light" to LabelEs("un","semáforo","semáforo"),
-    "fire hydrant"  to LabelEs("un","hidrante","hidrante"),
-    "stop sign"     to LabelEs("una","señal de alto","señal"),
-    "bench"         to LabelEs("una","banca","banca"),
-    "bird"          to LabelEs("un","pájaro","pájaro"),
-    "cat"           to LabelEs("un","gato","gato"),
-    "dog"           to LabelEs("un","perro","perro"),
-    "horse"         to LabelEs("un","caballo","caballo"),
-    "cow"           to LabelEs("una","vaca","vaca"),
-    "elephant"      to LabelEs("un","elefante","elefante"),
-    "bear"          to LabelEs("un","oso","oso"),
-    "backpack"      to LabelEs("una","mochila","mochila"),
-    "umbrella"      to LabelEs("un","paraguas","paraguas"),
-    "handbag"       to LabelEs("una","bolsa","bolsa"),
-    "suitcase"      to LabelEs("una","maleta","maleta"),
-    "chair"         to LabelEs("una","silla","silla"),
-    "couch"         to LabelEs("un","sofá","sofá"),
-    "potted plant"  to LabelEs("una","maceta","maceta"),
-    "bed"           to LabelEs("una","cama","cama"),
-    "dining table"  to LabelEs("una","mesa","mesa"),
-    "toilet"        to LabelEs("un","inodoro","inodoro"),
-    "tv"            to LabelEs("un","televisor","televisor"),
-    "laptop"        to LabelEs("una","computadora","computadora"),
-    "cell phone"    to LabelEs("un","celular","celular"),
-    "sink"          to LabelEs("un","lavabo","lavabo"),
-    "refrigerator"  to LabelEs("un","refrigerador","refrigerador"),
-    "bottle"        to LabelEs("una","botella","botella"),
-    "cup"           to LabelEs("una","taza","taza"),
-    "clock"         to LabelEs("un","reloj","reloj"),
-    "sports ball"   to LabelEs("una","pelota","pelota"),
-    "stairs"        to LabelEs("unas","escaleras","escaleras"),
-    "book"          to LabelEs("un","libro","libro"),
-    "vase"          to LabelEs("un","florero","florero")
+    // Personas
+    "person"         to LabelEs("una","persona","persona"),
+    "man"            to LabelEs("un","hombre","persona"),
+    "woman"          to LabelEs("una","mujer","persona"),
+    "boy"            to LabelEs("un","niño","persona"),
+    "girl"           to LabelEs("una","niña","persona"),
+    // Vehículos
+    "bicycle"        to LabelEs("una","bicicleta","bici"),
+    "car"            to LabelEs("un","automóvil","auto"),
+    "motorcycle"     to LabelEs("una","motocicleta","moto"),
+    "airplane"       to LabelEs("un","avión","avión"),
+    "aircraft"       to LabelEs("un","avión","avión"),
+    "bus"            to LabelEs("un","autobús","autobús"),
+    "train"          to LabelEs("un","tren","tren"),
+    "truck"          to LabelEs("un","camión","camión"),
+    "van"            to LabelEs("una","camioneta","camioneta"),
+    "taxi"           to LabelEs("un","taxi","taxi"),
+    "ambulance"      to LabelEs("una","ambulancia","ambulancia"),
+    "boat"           to LabelEs("un","bote","bote"),
+    // Señales
+    "traffic light"  to LabelEs("un","semáforo","semáforo"),
+    "traffic sign"   to LabelEs("una","señal","señal"),
+    "fire hydrant"   to LabelEs("un","hidrante","hidrante"),
+    "stop sign"      to LabelEs("una","señal de alto","señal"),
+    "parking meter"  to LabelEs("un","parquímetro","parquímetro"),
+    "bench"          to LabelEs("una","banca","banca"),
+    // Animales
+    "bird"           to LabelEs("un","pájaro","pájaro"),
+    "cat"            to LabelEs("un","gato","gato"),
+    "dog"            to LabelEs("un","perro","perro"),
+    "horse"          to LabelEs("un","caballo","caballo"),
+    "cattle"         to LabelEs("una","vaca","vaca"),
+    "elephant"       to LabelEs("un","elefante","elefante"),
+    "bear"           to LabelEs("un","oso","oso"),
+    "brown bear"     to LabelEs("un","oso pardo","oso"),
+    "zebra"          to LabelEs("una","cebra","cebra"),
+    "giraffe"        to LabelEs("una","jirafa","jirafa"),
+    "lion"           to LabelEs("un","león","león"),
+    "tiger"          to LabelEs("un","tigre","tigre"),
+    "deer"           to LabelEs("un","venado","venado"),
+    "crocodile"      to LabelEs("un","cocodrilo","cocodrilo"),
+    // Accesorios personales
+    "backpack"       to LabelEs("una","mochila","mochila"),
+    "umbrella"       to LabelEs("un","paraguas","paraguas"),
+    "handbag"        to LabelEs("una","bolsa","bolsa"),
+    "suitcase"       to LabelEs("una","maleta","maleta"),
+    "luggage and bags" to LabelEs("una","maleta","maleta"),
+    // Muebles — NUEVO: clases OIV7
+    "chair"          to LabelEs("una","silla","silla"),
+    "couch"          to LabelEs("un","sofá","sofá"),
+    "loveseat"       to LabelEs("un","sofá","sofá"),
+    "sofa bed"       to LabelEs("un","sofá cama","sofá"),
+    "studio couch"   to LabelEs("un","sofá","sofá"),
+    "bed"            to LabelEs("una","cama","cama"),
+    "infant bed"     to LabelEs("una","cuna","cuna"),
+    "kitchen & dining room table" to LabelEs("una","mesa","mesa"),
+    "coffee table"   to LabelEs("una","mesa de centro","mesa"),
+    "table"          to LabelEs("una","mesa","mesa"),
+    "desk"           to LabelEs("un","escritorio","escritorio"),
+    "toilet"         to LabelEs("un","inodoro","inodoro"),
+    "television"     to LabelEs("un","televisor","televisor"),
+    "laptop"         to LabelEs("una","computadora","computadora"),
+    "mobile phone"   to LabelEs("un","celular","celular"),
+    "sink"           to LabelEs("un","lavabo","lavabo"),
+    "refrigerator"   to LabelEs("un","refrigerador","refrigerador"),
+    "chest of drawers" to LabelEs("un","gavetero","gavetero"),
+    "nightstand"     to LabelEs("una","mesita de noche","mesita"),
+    "wardrobe"       to LabelEs("un","ropero","ropero"),
+    "bookcase"       to LabelEs("un","librero","librero"),
+    "cabinetry"      to LabelEs("un","armario","armario"),
+    "bathroom cabinet" to LabelEs("un","gabinete","gabinete"),
+    "filing cabinet" to LabelEs("un","archivero","archivero"),
+    "cupboard"       to LabelEs("una","alacena","alacena"),
+    "shelf"          to LabelEs("un","estante","estante"),
+    "mirror"         to LabelEs("un","espejo","espejo"),
+    "door"           to LabelEs("una","puerta","puerta"),
+    "window"         to LabelEs("una","ventana","ventana"),
+    "stairs"         to LabelEs("unas","escaleras","escaleras"),
+    "ladder"         to LabelEs("una","escalera","escalera"),
+    "lamp"           to LabelEs("una","lámpara","lámpara"),
+    "fireplace"      to LabelEs("una","chimenea","chimenea"),
+    "stool"          to LabelEs("un","taburete","taburete"),
+    "curtain"        to LabelEs("una","cortina","cortina"),
+    "pillow"         to LabelEs("una","almohada","almohada"),
+    "waste container" to LabelEs("un","basurero","basurero"),
+    "wheelchair"     to LabelEs("una","silla de ruedas","silla de ruedas"),
+    // Electrodomésticos
+    "microwave oven" to LabelEs("un","microondas","microondas"),
+    "oven"           to LabelEs("un","horno","horno"),
+    "toaster"        to LabelEs("una","tostadora","tostadora"),
+    "dishwasher"     to LabelEs("un","lavavajillas","lavavajillas"),
+    "washing machine" to LabelEs("una","lavadora","lavadora"),
+    "coffeemaker"    to LabelEs("una","cafetera","cafetera"),
+    "computer keyboard" to LabelEs("un","teclado","teclado"),
+    "computer monitor" to LabelEs("una","pantalla","pantalla"),
+    "computer mouse" to LabelEs("un","ratón","ratón"),
+    "remote control" to LabelEs("un","control","control"),
+    "printer"        to LabelEs("una","impresora","impresora"),
+    // Utensilios y cocina
+    "bottle"         to LabelEs("una","botella","botella"),
+    "coffee cup"     to LabelEs("una","taza","taza"),
+    "mug"            to LabelEs("una","taza","taza"),
+    "bowl"           to LabelEs("un","tazón","tazón"),
+    "clock"          to LabelEs("un","reloj","reloj"),
+    "digital clock"  to LabelEs("un","reloj digital","reloj"),
+    "wall clock"     to LabelEs("un","reloj de pared","reloj"),
+    "book"           to LabelEs("un","libro","libro"),
+    "vase"           to LabelEs("un","florero","florero"),
+    "houseplant"     to LabelEs("una","planta","planta"),
+    "plant"          to LabelEs("una","planta","planta"),
+    "scissors"       to LabelEs("unas","tijeras","tijeras"),
+    "toothbrush"     to LabelEs("un","cepillo dental","cepillo"),
+    "teddy bear"     to LabelEs("un","peluche","peluche"),
+    "wine glass"     to LabelEs("una","copa","copa"),
+    // Electrodomésticos / ventilación (frecuentes en interiores)
+    "ceiling fan"    to LabelEs("un","ventilador de techo","ventilador"),
+    "mechanical fan" to LabelEs("un","ventilador","ventilador"),
+    "heater"         to LabelEs("un","calefactor","calefactor"),
+    "humidifier"     to LabelEs("un","humidificador","humidificador"),
+    "gas stove"      to LabelEs("una","estufa de gas","estufa"),
+    "kitchen appliance" to LabelEs("un","electrodoméstico","electrodoméstico"),
+    "home appliance" to LabelEs("un","electrodoméstico","electrodoméstico"),
+    "blender"        to LabelEs("una","licuadora","licuadora"),
+    "kettle"         to LabelEs("una","tetera","tetera"),
+    "slow cooker"    to LabelEs("una","olla de cocción lenta","olla"),
+    "pressure cooker" to LabelEs("una","olla a presión","olla"),
+    "food processor" to LabelEs("un","procesador de alimentos","procesador"),
+    "sewing machine" to LabelEs("una","máquina de coser","máquina"),
+    // Baño
+    "bathtub"        to LabelEs("una","bañera","bañera"),
+    "shower"         to LabelEs("una","ducha","ducha"),
+    "tap"            to LabelEs("un","grifo","grifo"),
+    "towel"          to LabelEs("una","toalla","toalla"),
+    "soap dispenser" to LabelEs("un","dispensador de jabón","jabón"),
+    // Habitación / sala
+    "closet"         to LabelEs("un","clóset","clóset"),
+    "drawer"         to LabelEs("un","cajón","cajón"),
+    "door handle"    to LabelEs("una","manija","manija"),
+    "window blind"   to LabelEs("una","persiana","persiana"),
+    "picture frame"  to LabelEs("un","cuadro","cuadro"),
+    "countertop"     to LabelEs("una","encimera","encimera"),
+    "jacuzzi"        to LabelEs("un","jacuzzi","jacuzzi"),
+    // Gimnasio / deporte
+    "treadmill"      to LabelEs("una","caminadora","caminadora"),
+    "stationary bicycle" to LabelEs("una","bicicleta estática","bici"),
+    "indoor rower"   to LabelEs("una","máquina de remo","máquina"),
+    "dumbbell"       to LabelEs("una","pesa","pesa"),
+    "training bench" to LabelEs("una","banca de ejercicio","banca"),
+    "punching bag"   to LabelEs("un","saco de boxeo","saco"),
+    // Otros objetos comunes en interiores
+    "whiteboard"     to LabelEs("una","pizarra","pizarra"),
+    "poster"         to LabelEs("un","póster","póster"),
+    "light switch"   to LabelEs("un","interruptor","interruptor"),
+    "light bulb"     to LabelEs("una","bombilla","bombilla"),
+    "power plugs and sockets" to LabelEs("un","enchufe","enchufe"),
+    "toilet paper"   to LabelEs("un","papel higiénico","papel"),
+    "flowerpot"      to LabelEs("una","maceta","maceta"),
+    "sculpture"      to LabelEs("una","escultura","escultura"),
+    "box"            to LabelEs("una","caja","caja"),
+    "cat furniture"  to LabelEs("un","árbol para gatos","árbol"),
+    // Exterior — estas faltan y aparecen en inglés
+    "house"          to LabelEs("una","casa","casa"),
+    "building"       to LabelEs("un","edificio","edificio"),
+    "office building" to LabelEs("un","edificio","edificio"),
+    "tree"           to LabelEs("un","árbol","árbol"),
+    "palm tree"      to LabelEs("una","palma","palma"),
+    "fence"          to LabelEs("una","cerca","cerca"),
+    "gate"           to LabelEs("una","reja","reja"),
+    "porch"          to LabelEs("un","portal","portal"),
+    "tower"          to LabelEs("una","torre","torre"),
+    "skyscraper"     to LabelEs("un","rascacielos","rascacielos"),
+    "street light"   to LabelEs("un","poste de luz","poste"),
+    "traffic cone"   to LabelEs("un","cono de tráfico","cono"),
+    "road"           to LabelEs("una","calle","calle"),
+    // Ropa y personas (aparecen en inglés)
+    "clothing"       to LabelEs("ropa","ropa","ropa"),
+    "fashion accessory" to LabelEs("un","accesorio","accesorio"),
+    "footwear"       to LabelEs("calzado","calzado","calzado"),
+    "coat"           to LabelEs("un","abrigo","abrigo"),
+    "jacket"         to LabelEs("una","chaqueta","chaqueta"),
+    "dress"          to LabelEs("un","vestido","vestido"),
+    "shirt"          to LabelEs("una","camisa","camisa"),
+    "jeans"          to LabelEs("unos","pantalones","pantalón"),
+    "shorts"         to LabelEs("unos","shorts","shorts"),
+    "hat"            to LabelEs("un","sombrero","sombrero"),
+    "sunglasses"     to LabelEs("unos","lentes","lentes"),
+    "glasses"        to LabelEs("unos","lentes","lentes"),
+    // Naturaleza / exterior
+    "flower"         to LabelEs("una","flor","flor"),
+    "rose"           to LabelEs("una","rosa","rosa"),
+    "houseplant"     to LabelEs("una","planta","planta"),
+    "mushroom"       to LabelEs("un","hongo","hongo"),
+    // Animales comunes no mapeados
+    "rabbit"         to LabelEs("un","conejo","conejo"),
+    "squirrel"       to LabelEs("una","ardilla","ardilla"),
+    "turtle"         to LabelEs("una","tortuga","tortuga"),
+    "duck"           to LabelEs("un","pato","pato"),
+    "chicken"        to LabelEs("un","pollo","pollo"),
+    "goat"           to LabelEs("una","cabra","cabra"),
+    "sheep"          to LabelEs("una","oveja","oveja"),
+    "pig"            to LabelEs("un","cerdo","cerdo"),
+    "snake"          to LabelEs("una","serpiente","serpiente"),
+    // Vehículos extra
+    "segway"         to LabelEs("un","segway","segway"),
+    "skateboard"     to LabelEs("una","patineta","patineta"),
+    "jet ski"        to LabelEs("una","moto de agua","moto de agua"),
+    "helicopter"     to LabelEs("un","helicóptero","helicóptero"),
+    // Objetos comunes sin traducir
+    "barrel"         to LabelEs("un","barril","barril"),
+    "box"            to LabelEs("una","caja","caja"),
+    "container"      to LabelEs("un","contenedor","contenedor"),
+    "ladder"         to LabelEs("una","escalera","escalera"),
+    "rope"           to LabelEs("una","cuerda","cuerda"),
+    "chain"          to LabelEs("una","cadena","cadena"),
+    "flag"           to LabelEs("una","bandera","bandera"),
+    "sign"           to LabelEs("un","letrero","letrero"),
+    "billboard"      to LabelEs("una","valla","valla"),
+    "fire hydrant"   to LabelEs("un","hidrante","hidrante")
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OVERLAY VISUAL — dibuja bounding boxes sobre la cámara (modo demo)
-// ─────────────────────────────────────────────────────────────────────────────
+//dibujar boxes en cada objeto que vaya detectando
+
 class DetectionOverlay @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    // Colores por nivel de peligro
-    private val paintCritico   = Paint().apply { color = Color.RED;    strokeWidth = 6f; style = Paint.Style.STROKE }
-    private val paintPeligro   = Paint().apply { color = Color.parseColor("#FF6600"); strokeWidth = 5f; style = Paint.Style.STROKE }
-    private val paintCerca     = Paint().apply { color = Color.YELLOW; strokeWidth = 4f; style = Paint.Style.STROKE }
-    private val paintAviso     = Paint().apply { color = Color.parseColor("#00CCFF"); strokeWidth = 3f; style = Paint.Style.STROKE }
-    private val paintLejano    = Paint().apply { color = Color.WHITE;  strokeWidth = 2f; style = Paint.Style.STROKE; alpha = 150 }
+    private val paintCritico = Paint().apply { color = Color.RED;    strokeWidth = 7f; style = Paint.Style.STROKE }
+    private val paintPeligro = Paint().apply { color = Color.parseColor("#FF6600"); strokeWidth = 5f; style = Paint.Style.STROKE }
+    private val paintCerca   = Paint().apply { color = Color.YELLOW; strokeWidth = 4f; style = Paint.Style.STROKE }
+    private val paintAviso   = Paint().apply { color = Color.parseColor("#00CCFF"); strokeWidth = 3f; style = Paint.Style.STROKE }
+    private val paintLejano  = Paint().apply { color = Color.WHITE;  strokeWidth = 2f; style = Paint.Style.STROKE; alpha = 130 }
 
     private val paintText = Paint().apply {
-        color     = Color.WHITE
-        textSize  = 36f
-        typeface  = Typeface.DEFAULT_BOLD
-        setShadowLayer(3f, 1f, 1f, Color.BLACK)
+        color = Color.WHITE; textSize = 34f; typeface = Typeface.DEFAULT_BOLD
+        setShadowLayer(4f, 1f, 1f, Color.BLACK)
     }
     private val paintTextBg = Paint().apply {
-        color = Color.parseColor("#AA000000")
-        style = Paint.Style.FILL
+        color = Color.parseColor("#BB000000"); style = Paint.Style.FILL
     }
 
-    // Lista de detecciones actual — actualizada desde el hilo de análisis
-    @Volatile private var detections: List<Pair<RectF, Pair<String, Float>>> = emptyList()
-    @Volatile private var imgW = 1; @Volatile private var imgH = 1
+    private val smoothedBoxes = mutableMapOf<String, RectF>()
+    private val LERP = 0.13f  // bajo para boxes estables como cámaras de seguridad
 
-    fun update(dets: List<Pair<RectF, Pair<String, Float>>>, width: Int, height: Int) {
-        detections = dets; imgW = width; imgH = height
-        postInvalidate()  // pide redibujo en el hilo UI
+    @Volatile private var tracks: List<ObjectTrack> = emptyList()
+
+    /** Recibe los ObjectTrack del TrackManager — claves estables por track.id */
+    fun update(newTracks: List<ObjectTrack>) {
+        tracks = newTracks
+        postInvalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val dets = detections; if (dets.isEmpty()) return
+        val current = tracks
+        if (current.isEmpty()) { smoothedBoxes.clear(); return }
 
         val scaleX = width.toFloat()
         val scaleY = height.toFloat()
+        val currentKeys = mutableSetOf<String>()
 
-        for ((normBox, labelScore) in dets) {
-            val (label, score) = labelScore
+        for (track in current) {
+            val key = track.id.toString()
+            currentKeys.add(key)
 
-            // Desnormalizar a píxeles de pantalla
-            val left   = normBox.left   * scaleX
-            val top    = normBox.top    * scaleY
-            val right  = normBox.right  * scaleX
-            val bottom = normBox.bottom * scaleY
+            // Usar smoothW/smoothH (Kalman sobre dimensiones) para estabilizar el tamaño
+            val bw = track.smoothW
+            val bh = track.smoothH
+            val targetBox = RectF(
+                (track.cx - bw / 2f) * scaleX, (track.cy - bh / 2f) * scaleY,
+                (track.cx + bw / 2f) * scaleX, (track.cy + bh / 2f) * scaleY
+            )
 
-            val area  = normBox.width() * normBox.height()
-            val depth = when {
-                area >= 0.20f -> 0.85f
-                area >= 0.08f -> 0.65f
-                area >= 0.03f -> 0.48f
-                area >= 0.01f -> 0.32f
-                else          -> 0.18f
-            }
+            val smoothed = smoothedBoxes.getOrPut(key) { RectF(targetBox) }
+            smoothed.left   += (targetBox.left   - smoothed.left)   * LERP
+            smoothed.top    += (targetBox.top    - smoothed.top)    * LERP
+            smoothed.right  += (targetBox.right  - smoothed.right)  * LERP
+            smoothed.bottom += (targetBox.bottom - smoothed.bottom) * LERP
 
-            // Seleccionar color según nivel de peligro
             val paint = when {
-                depth >= DEPTH_CRITICO -> paintCritico
-                depth >= DEPTH_PELIGRO -> paintPeligro
-                depth >= DEPTH_CERCA   -> paintCerca
-                depth >= DEPTH_AVISO   -> paintAviso
-                else                   -> paintLejano
+                track.depthScore >= DEPTH_CRITICO -> paintCritico
+                track.depthScore >= DEPTH_PELIGRO -> paintPeligro
+                track.depthScore >= DEPTH_CERCA   -> paintCerca
+                track.depthScore >= DEPTH_AVISO   -> paintAviso
+                else                              -> paintLejano
             }
 
-            // Dibujar bounding box
-            canvas.drawRect(left, top, right, bottom, paint)
+            canvas.drawRect(smoothed, paint)
 
-            // Etiqueta con nombre y score
-            val shortName = LABEL_ES[label]?.short ?: label
-            val labelText = "$shortName ${(score * 100).toInt()}%"
+            // Etiqueta: nombre + distancia estimada
+            val name  = LABEL_ES[track.label]?.short ?: track.label
+            val distM = DepthCalibration.toMeters(track.depthScore)
+            val distStr = if (distM < 5.5f) " ~${"%.1f".format(distM)}m" else ""
+            val moveIndicator = when {
+                track.vDepth > 0.015f -> " →"   // acercándose
+                track.vDepth < -0.015f -> " ←"  // alejándose
+                else -> ""
+            }
+            val labelText = "$name$distStr$moveIndicator"
             val textW = paintText.measureText(labelText)
             val textH = paintText.textSize
 
-            // Fondo de la etiqueta
-            canvas.drawRect(left, top - textH - 8f, left + textW + 12f, top, paintTextBg)
-
-            // Color del texto igual al del box
+            canvas.drawRect(smoothed.left, smoothed.top - textH - 8f,
+                smoothed.left + textW + 12f, smoothed.top, paintTextBg)
             paintText.color = paint.color
-            canvas.drawText(labelText, left + 6f, top - 6f, paintText)
+            canvas.drawText(labelText, smoothed.left + 6f, smoothed.top - 6f, paintText)
         }
+
+        smoothedBoxes.keys.retainAll(currentKeys)
     }
 }
 
@@ -272,8 +533,7 @@ class YoloDetector(modelPath: String, context: Context) {
             val fd     = context.assets.openFd(modelPath)
             val buffer = FileInputStream(fd.fileDescriptor).channel
                 .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-            // CPU x4 hilos — estable en todos los dispositivos
-            // En Snapdragon 7s Gen 4 esto da ~80-120ms por frame
+
             interpreter = Interpreter(buffer, Interpreter.Options().apply { numThreads = 4 })
             Log.d(TAG, "YOLOv8n OK — CPU x4")
         } catch (e: Exception) { Log.e(TAG, "Error YOLO: ${e.message}") }
@@ -281,19 +541,43 @@ class YoloDetector(modelPath: String, context: Context) {
 
     fun detect(bitmap: Bitmap): List<Detection> {
         val interp  = interpreter ?: return emptyList()
-        val scaled  = Bitmap.createScaledBitmap(bitmap, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, true)
+
+        // ── LETTERBOX: escalar conservando proporción y rellenar a un cuadrado ──
+        // Sin esto, el frame vertical se APLASTA a 320×320 → YOLO clasifica mal
+        // (falsos positivos) y las cajas salen deformadas → distancias erróneas.
+        val w0 = bitmap.width.toFloat(); val h0 = bitmap.height.toFloat()
+        val scale = minOf(YOLO_INPUT_SIZE / w0, YOLO_INPUT_SIZE / h0)
+        val newW  = (w0 * scale).roundToInt()
+        val newH  = (h0 * scale).roundToInt()
+        val padX  = (YOLO_INPUT_SIZE - newW) / 2f
+        val padY  = (YOLO_INPUT_SIZE - newH) / 2f
+
+        val resized = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+        val letter  = Bitmap.createBitmap(YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, Bitmap.Config.ARGB_8888)
+        Canvas(letter).apply {
+            drawColor(Color.rgb(114, 114, 114))   // gris neutro estándar de YOLO
+            drawBitmap(resized, padX, padY, null)
+        }
+        if (resized !== bitmap) resized.recycle()
+
         val inputBuf = ByteBuffer.allocateDirect(4 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3)
             .order(ByteOrder.nativeOrder())
 
         for (y in 0 until YOLO_INPUT_SIZE) for (x in 0 until YOLO_INPUT_SIZE) {
-            val px = scaled.getPixel(x, y)
+            val px = letter.getPixel(x, y)
             inputBuf.putFloat(((px shr 16) and 0xFF) / 255f)
             inputBuf.putFloat(((px shr  8) and 0xFF) / 255f)
             inputBuf.putFloat(( px         and 0xFF) / 255f)
         }
         inputBuf.rewind()
+        letter.recycle()
 
-        val outputBuf = Array(1) { Array(84) { FloatArray(2100) } }
+        // Factores para revertir el letterbox: de coords del cuadrado de entrada
+        // a coords normalizadas del frame ORIGINAL.
+        val sx = newW / YOLO_INPUT_SIZE.toFloat(); val ox = padX / YOLO_INPUT_SIZE
+        val sy = newH / YOLO_INPUT_SIZE.toFloat(); val oy = padY / YOLO_INPUT_SIZE
+
+        val outputBuf = Array(1) { Array(605) { FloatArray(2100) } }
         try { interp.run(inputBuf, outputBuf) }
         catch (e: Exception) { Log.e(TAG, "YOLO inf: ${e.message}"); return emptyList() }
 
@@ -303,12 +587,15 @@ class YoloDetector(modelPath: String, context: Context) {
 
         for (a in 0 until 2100) {
             var bestCls = 0; var bestScore = 0f
-            for (c in 0 until 80) {
+            for (c in 0 until 601) {
                 val s = raw[4 + c][a]; if (s > bestScore) { bestScore = s; bestCls = c }
             }
             if (bestScore < SCORE_MINIMO) continue
-            val cx = raw[0][a]; val cy = raw[1][a]
-            val w  = raw[2][a]; val h  = raw[3][a]
+            // Deshacer el letterbox: pasar de coords del cuadrado al frame original
+            val cx = (raw[0][a] - ox) / sx
+            val cy = (raw[1][a] - oy) / sy
+            val w  = raw[2][a] / sx
+            val h  = raw[3][a] / sy
             val box = RectF(
                 (cx - w / 2f).coerceIn(0f, 1f), (cy - h / 2f).coerceIn(0f, 1f),
                 (cx + w / 2f).coerceIn(0f, 1f), (cy + h / 2f).coerceIn(0f, 1f)
@@ -327,7 +614,7 @@ class YoloDetector(modelPath: String, context: Context) {
             }
         }
         return raws.indices.filter { kept[it] }.take(MAX_DETECCIONES)
-            .map { Detection(raws[it].box, COCO_LABELS.getOrElse(raws[it].cls) { "objeto" }, raws[it].score) }
+            .map { Detection(raws[it].box, OIV7_LABELS.getOrElse(raws[it].cls) { "objeto" }, raws[it].score) }
     }
 
     private fun iou(a: RectF, b: RectF): Float {
@@ -395,13 +682,16 @@ data class ObjectTrack(
     var vx: Float = 0f, var vy: Float = 0f, var vDepth: Float = 0f,
     var framesLost: Int = 0, var framesTracked: Int = 0,
     var lastSeen: Long = 0L, var score: Float = 0f,
-    var dangerLevel: Int = 0, var dangerFrames: Int = 0
+    var dangerLevel: Int = 0, var dangerFrames: Int = 0,
+    var smoothW: Float = box.width(), var smoothH: Float = box.height()
 ) {
     fun update(newBox: RectF, newDepth: Float, now: Long) {
         val newCx = newBox.centerX(); val newCy = newBox.centerY()
         vx     = KALMAN_SMOOTH * vx     + (1f - KALMAN_SMOOTH) * (newCx - cx)
         vy     = KALMAN_SMOOTH * vy     + (1f - KALMAN_SMOOTH) * (newCy - cy)
         vDepth = KALMAN_SMOOTH * vDepth + (1f - KALMAN_SMOOTH) * (newDepth - depthScore)
+        smoothW = KALMAN_SMOOTH * smoothW + (1f - KALMAN_SMOOTH) * newBox.width()
+        smoothH = KALMAN_SMOOTH * smoothH + (1f - KALMAN_SMOOTH) * newBox.height()
         box = newBox; cx = newCx; cy = newCy; depthScore = newDepth
         framesLost = 0; framesTracked++; lastSeen = now
         val newLevel = when {
@@ -482,59 +772,36 @@ class TrackManager {
         var sum = 0f; var count = 0
         for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
         val midasRaw = if (count > 0) sum / count else 0f
-        // PROBLEMA: MiDaS en interiores asigna valores altos a TODO porque todo está
-        // relativamente cerca dentro de una habitación pequeña — infla el depthScore.
-        // SOLUCIÓN: usar estimación métrica por altura real como ancla cuando está disponible.
-        val metricAnchor = metricDepthFromHeight(box, label)
+        // Usar ancla métrica combinada (altura + ancho + techo de píxeles).
+        // Si MiDaS infla valores en interiores, la métrica lo corrige.
+        val metricAnchor = bestMetricAnchor(box, label)
         return if (metricAnchor != null) {
-            // 60% métrica (escala real) + 40% MiDaS (captura movimiento relativo)
-            // Si MiDaS dice "cerca" pero métricamente es lejos → la métrica lo corrige.
-            val raw = (metricAnchor * 0.6f + midasRaw * 0.4f)
-            val cap = if (label in SAFE_OBJECTS) DEPTH_PELIGRO - 0.05f else 1f
-            raw.coerceAtMost(cap).coerceIn(0f, 1f)
+            // 40% métrica (tamaño del box) + 60% MiDaS (profundidad real)
+            // Más peso a MiDaS para no inflar distancias cuando YOLO dibuja boxes grandes
+            (metricAnchor * 0.40f + midasRaw * 0.60f).coerceIn(0f, 1f)
         } else {
-            // Sin referencia métrica: MiDaS limitado por cap conservador de área
+            // Sin referencia métrica: MiDaS con techo conservador basado en área
             val areaCap = (box.width() * box.height() * 1.5f + 0.15f).coerceAtMost(0.45f)
             minOf(midasRaw, areaCap + 0.20f).coerceIn(0f, 1f)
         }
     }
 
     private fun fallback(box: RectF, label: String = ""): Float {
-        // Primero intentar estimación métrica por altura real del objeto (más precisa)
-        val metricDepth = metricDepthFromHeight(box, label)
-        if (metricDepth != null) {
-            // Objetos seguros: cap en DEPTH_PELIGRO - 0.05 = 0.57 (permite avisar si muy cerca, nunca gritar)
-            val cap = if (label in SAFE_OBJECTS) DEPTH_PELIGRO - 0.05f else 1f
-            return metricDepth.coerceAtMost(cap).coerceIn(0f, 1f)
-        }
-        // Si no hay altura típica conocida, usar área con techo conservador
+        val metricDepth = bestMetricAnchor(box, label)
+        if (metricDepth != null) return metricDepth.coerceIn(0f, 1f)
         val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        return (area * 1.5f + 0.15f).coerceAtMost(0.42f)
+        return (area * 2.5f + 0.10f).coerceAtMost(0.90f)
     }
 
     fun allTracks(): List<ObjectTrack> = tracks.filter { it.framesLost == 0 }
     fun clear() = tracks.clear()
 
-    // Altura real típica de objetos conocidos (en metros)
-    private val TYPICAL_HEIGHT_M = mapOf(
-        "person" to 1.70f, "bicycle" to 1.10f, "car" to 1.45f, "motorcycle" to 1.20f,
-        "bus" to 3.20f, "truck" to 3.00f, "traffic light" to 1.20f, "stop sign" to 0.60f,
-        "bench" to 0.90f, "dog" to 0.50f, "chair" to 0.90f, "couch" to 0.80f,
-        "dining table" to 0.75f, "fire hydrant" to 0.60f, "parking meter" to 1.20f,
-        "train" to 3.50f, "boat" to 2.00f
-    )
-
-    // Estima distancia en metros usando la proporción del objeto en imagen.
-    // FOV vertical ~65°, distancia focal normalizada ~0.9
-    // Retorna profundidad normalizada 0..1 (1 = muy cerca, 0 = muy lejos, max 15m)
-    private fun metricDepthFromHeight(box: RectF, label: String): Float? {
-        val realH = TYPICAL_HEIGHT_M[label] ?: return null
-        val imgH  = box.height()
-        if (imgH <= 0.005f) return null
-        val distanceM = realH / (imgH * 1.134f)
-        val depth = (1f - (distanceM / 15f)).coerceIn(0f, 1f)
-        Log.v(TAG, "METRIC $label imgH=${"%.3f".format(imgH)} dist=${"%.1f".format(distanceM)}m depth=${"%.2f".format(depth)}")
-        return depth
+    private fun bestMetricAnchor(box: RectF, label: String): Float? {
+        val anchor = DepthCalibration.bestAnchor(box.width(), box.height(), label)
+        if (anchor != null)
+            Log.v(TAG, "ANCHOR $label w=${"%.2f".format(box.width())} h=${"%.2f".format(box.height())} " +
+                "→ depth=${"%.2f".format(anchor)} (~${"%.1f".format(DepthCalibration.toMeters(anchor))}m)")
+        return anchor
     }
 }
 
@@ -551,6 +818,8 @@ data class NavEvent(val message: String, val priority: EventPriority, val ts: Lo
 class TtsPriorityQueue(private val tts: TextToSpeech) {
     private val queue = PriorityQueue<NavEvent>()
     private var lastTime = 0L; private var lastPriority = EventPriority.QUIETO
+    var userSpeedMultiplier = 1.0f
+    var userPitch           = 1.0f
 
     private val cooldowns = mapOf(
         EventPriority.CRITICO            to COOLDOWN_CRITICO,
@@ -570,465 +839,31 @@ class TtsPriorityQueue(private val tts: TextToSpeech) {
     }
 
     @Synchronized fun flush() {
+        // Descartar mensajes viejos de baja prioridad (evita instrucciones de una escena anterior).
+        while (true) {
+            val ev = queue.peek() ?: return
+            if (ev.priority.level < EventPriority.PELIGRO_INMEDIATO.level) {
+                val staleMs = if (ev.priority == EventPriority.NAVEGACION_URGENTE) 3_000L else 2_500L
+                if (System.currentTimeMillis() - ev.ts > staleMs) { queue.poll(); continue }
+            }
+            break
+        }
         val event = queue.peek() ?: return
         val interrupt = event.priority.level >= EventPriority.PELIGRO_INMEDIATO.level
         if (tts.isSpeaking && !interrupt) return
         queue.poll()
-        val speed = when (event.priority) {
-            EventPriority.CRITICO            -> 1.2f
-            EventPriority.PELIGRO_INMEDIATO  -> 1.15f
-            EventPriority.NAVEGACION_URGENTE -> 1.05f
-            else -> 0.95f
+        val baseSpeed = when (event.priority) {
+            EventPriority.CRITICO            -> 1.1f
+            EventPriority.PELIGRO_INMEDIATO  -> 1.05f
+            EventPriority.NAVEGACION_URGENTE -> 1.0f
+            else -> 0.98f
         }
-        tts.setSpeechRate(speed)
+        if (event.priority == EventPriority.CRITICO && tts.isSpeaking) tts.stop()
+        tts.setPitch(userPitch)
+        tts.setSpeechRate(baseSpeed * userSpeedMultiplier)
         tts.speak(event.message, TextToSpeech.QUEUE_FLUSH, null,
             "nav_${event.priority.name}_${System.currentTimeMillis()}")
         lastTime = System.currentTimeMillis(); lastPriority = event.priority
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// INFERENCIA DE ESCENA — detecta tipo de habitación además de interior/exterior
-// ─────────────────────────────────────────────────────────────────────────────
-enum class SceneType {
-    COCINA, HABITACION, SALA, BANO, OFICINA,
-    INTERIOR_DESPEJADO, INTERIOR_CONCURRIDO,
-    EXTERIOR_TRANQUILO, EXTERIOR_CONCURRIDO,
-    CRUCE_PELIGROSO, DESCONOCIDO
-}
-
-private val COCINA_HINTS    = setOf("microwave","oven","toaster","refrigerator","sink","bowl","cup","bottle","fork","knife","spoon")
-private val HABITACION_HINTS= setOf("bed","clock","teddy bear","hair drier")
-private val SALA_HINTS      = setOf("couch","tv","remote","vase","potted plant","book")
-private val BANO_HINTS      = setOf("toilet","sink","toothbrush","hair drier")
-private val OFICINA_HINTS   = setOf("laptop","keyboard","mouse","chair","clock","book","cell phone")
-
-fun inferScene(labels: List<String>, areas: List<Float>): SceneType {
-    if (labels.isEmpty()) return SceneType.DESCONOCIDO
-    val indoor   = labels.count { it in INDOOR_OBJS }
-    val outdoor  = labels.count { it in OUTDOOR_OBJS }
-    val persons  = labels.count { it == "person" }
-    val cross    = labels.count { it in CROSSING_HINTS }
-    if (cross >= 2 && (labels.contains("traffic light") || labels.contains("stop sign")))
-        return SceneType.CRUCE_PELIGROSO
-
-    val isIndoor  = indoor  > outdoor || (indoor  > 0 && outdoor == 0)
-    val isOutdoor = outdoor > indoor  || (outdoor > 0 && indoor  == 0)
-    val crowded   = labels.size >= 5 || persons >= 3 || areas.sum() > 0.35f
-
-    // Detectar tipo de habitación por objetos característicos
-    if (isIndoor) {
-        val cocinaScore  = labels.count { it in COCINA_HINTS }
-        val habScore     = labels.count { it in HABITACION_HINTS }
-        val salaScore    = labels.count { it in SALA_HINTS }
-        val banoScore    = labels.count { it in BANO_HINTS }
-        val oficScore    = labels.count { it in OFICINA_HINTS }
-        val maxScore = maxOf(cocinaScore, habScore, salaScore, banoScore, oficScore)
-        if (maxScore >= 2) return when (maxScore) {
-            cocinaScore  -> SceneType.COCINA
-            habScore     -> SceneType.HABITACION
-            salaScore    -> SceneType.SALA
-            banoScore    -> SceneType.BANO
-            else         -> SceneType.OFICINA
-        }
-        return if (crowded) SceneType.INTERIOR_CONCURRIDO else SceneType.INTERIOR_DESPEJADO
-    }
-
-    return when {
-        isOutdoor && crowded  -> SceneType.EXTERIOR_CONCURRIDO
-        isOutdoor && !crowded -> SceneType.EXTERIOR_TRANQUILO
-        crowded               -> SceneType.INTERIOR_CONCURRIDO
-        else                  -> SceneType.DESCONOCIDO
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MOTOR DE NAVEGACIÓN — Guía como acompañante humano
-//
-// REGLAS implementadas:
-//   1. SEGURIDAD primero — peligros interrumpen siempre
-//   2. BAJA LATENCIA — para objetos peligrosos no se espera confirmación de frames
-//   3. PREDICCIÓN de tendencia — acercándose sube prioridad, alejándose la baja
-//   4. ZONAS — centro > laterales con movimiento hacia el usuario
-//   5. DISTANCIA — <2m crítico | 3-4m desvío | 5-7m aviso | >7m contexto
-//   6. SALIDA — máximo 2 frases, directas, accionables
-//      Verbos: AVANZA / DETENTE / GIRA / ESQUIVA / PRECAUCIÓN
-// ─────────────────────────────────────────────────────────────────────────────
-object NavigationEngine {
-    data class NavDecision(
-        val instruction: String,
-        val priority: EventPriority,
-        val vibrateMs: Long = 0L,
-        val requestScan: Boolean = false
-    )
-
-    // Objetos que NO esperan confirmación de frames si están cerca y vienen al centro
-    // Son inherentemente peligrosos y necesitan reacción inmediata
-    private val SIN_CONFIRMACION = setOf("car","truck","bus","motorcycle","bicycle","person","dog")
-
-    fun decide(tracks: List<ObjectTrack>): NavDecision? {
-        if (tracks.isEmpty()) return NavDecision("Camino libre. Avanza.", EventPriority.CONTEXTO)
-
-        // Separar tracks confiables (con historia) de los de alta prioridad sin historia
-        // Los objetos peligrosos se reportan desde el primer frame si están muy cerca
-        val reliable = tracks.filter { t ->
-            t.framesTracked >= 2 || (t.label in SIN_CONFIRMACION && t.depthScore >= DEPTH_PELIGRO)
-        }
-        if (reliable.isEmpty()) return null
-
-        val center = reliable.filter { it.zone == "centro" }.maxByOrNull { it.depthScore }
-        val left   = reliable.filter { it.zone == "izquierda" }
-        val right  = reliable.filter { it.zone == "derecha" }
-        val lClear = left.none  { it.depthScore >= DEPTH_CERCA }
-        val rClear = right.none { it.depthScore >= DEPTH_CERCA }
-
-        // ── REGLA 1: CRÍTICO — <2m, acercándose, en trayectoria central ──────
-        // No espera confirmación. Interrumpe cualquier mensaje.
-        reliable.filter { it.zone == "centro" && it.isApproaching }
-            .mapNotNull { t ->
-                val (pd, _) = t.predict(COLLISION_FRAMES)
-                if (pd >= DEPTH_CRITICO) t to pd else null
-            }
-            .maxByOrNull { it.second }
-            ?.let { (t, _) ->
-                val obj = shortName(t.label)
-                val dir = when {
-                    lClear -> " Esquiva a la izquierda."
-                    rClear -> " Esquiva a la derecha."
-                    else   -> " Detente ahora."
-                }
-                return NavDecision("¡Precaución! $obj al frente.$dir",
-                    EventPriority.CRITICO, 1000L)
-            }
-
-        // ── REGLA 2: PELIGRO INMEDIATO — 2-3m en centro ──────────────────────
-        // Objeto muy cercano bloqueando el paso. Requiere acción inmediata.
-        if (center != null && center.depthScore >= DEPTH_PELIGRO) {
-            val obj = shortName(center.label)
-            return when {
-                lClear && !rClear ->
-                    NavDecision("Detente. $obj al frente. Gira a la izquierda.",
-                        EventPriority.PELIGRO_INMEDIATO, 800L)
-                rClear && !lClear ->
-                    NavDecision("Detente. $obj al frente. Gira a la derecha.",
-                        EventPriority.PELIGRO_INMEDIATO, 800L)
-                else ->
-                    // Bloqueado por ambos lados → pedir escaneo lateral
-                    NavDecision("Detente. $obj bloqueando. Mueve el teléfono a los lados.",
-                        EventPriority.PELIGRO_INMEDIATO, 800L, requestScan = true)
-            }
-        }
-
-        // ── REGLA 3: VEHÍCULO LATERAL ACERCÁNDOSE ─────────────────────────────
-        // Un vehículo que viene de lado puede ser más peligroso que algo estático adelante
-        val vehiculoLateral = (left + right)
-            .filter { it.label in VEHICLES && it.isApproaching && it.depthScore >= DEPTH_CERCA }
-            .maxByOrNull { it.depthScore }
-
-        if (vehiculoLateral != null) {
-            val obj  = shortName(vehiculoLateral.label)
-            val away = if (vehiculoLateral.zone == "izquierda") "derecha" else "izquierda"
-            return NavDecision("¡Precaución! $obj por ${vehiculoLateral.zone}. Muévete a la $away.",
-                EventPriority.PELIGRO_INMEDIATO, 600L)
-        }
-
-        // ── REGLA 4: DESVÍO — 3-4m en centro ─────────────────────────────────
-        // Objeto cerca pero aún hay tiempo para esquivar suavemente
-        if (center != null && center.depthScore >= DEPTH_CERCA) {
-            val obj = shortName(center.label)
-            val dir = if (lClear) "izquierda" else if (rClear) "derecha" else "un lado"
-            val accion = if (center.isApproaching) "Esquiva" else "Desvíate"
-            return NavDecision("$obj adelante. $accion hacia la $dir.",
-                EventPriority.NAVEGACION_URGENTE, 300L)
-        }
-
-        // ── REGLA 5: AVISO ANTICIPADO — 5-7m ─────────────────────────────────
-        // Objeto en zona de aviso. Si se acerca, subir prioridad.
-        if (center != null && center.depthScore >= DEPTH_AVISO) {
-            val obj = shortName(center.label)
-            return if (center.isApproaching)
-                NavDecision("Precaución. $obj al frente y acercándose. Prepárate para desviar.",
-                    EventPriority.NAVEGACION_NORMAL)
-            else
-                NavDecision("Precaución. $obj al frente. Avanza con cuidado.",
-                    EventPriority.NAVEGACION_NORMAL)
-        }
-
-        // ── REGLA 6: AMENAZA LATERAL — objeto acercándose desde un lado ──────
-        val amenazaLateral = (left + right)
-            .filter { it.isApproaching && it.depthScore >= DEPTH_CERCA && it.isConfirmed }
-            .maxByOrNull { it.depthScore }
-
-        if (amenazaLateral != null) {
-            val obj  = shortName(amenazaLateral.label)
-            val away = if (amenazaLateral.zone == "izquierda") "derecha" else "izquierda"
-            return NavDecision("$obj por ${amenazaLateral.zone}. Desvíate a la $away.",
-                EventPriority.NAVEGACION_URGENTE, 300L)
-        }
-
-        // ── REGLA 7: CONTEXTO LEJANO — objetos a >7m o estáticos en laterales ─
-        // Solo para objetos de alta prioridad que vale la pena mencionar
-        val lejano = reliable
-            .filter { it.depthScore >= DEPTH_LEJANO && it.label in HIGH_PRIORITY_OBJS && !it.isApproaching }
-            .maxByOrNull { it.depthScore }
-
-        if (lejano != null) {
-            val obj = shortName(lejano.label)
-            val pos = if (lejano.zone == "centro") "al frente" else "a la ${lejano.zone}"
-            return NavDecision("$obj $pos. Continúa con precaución.",
-                EventPriority.CONTEXTO)
-        }
-
-        // ── CAMINO LIBRE ──────────────────────────────────────────────────────
-        return NavDecision("Camino libre. Avanza.", EventPriority.CONTEXTO)
-    }
-
-    private fun shortName(label: String): String = LABEL_ES[label]?.short ?: label
-
-    // Función auxiliar pública para que processFrame pueda consultar si hay
-    // peligro activo (para suprimir mensajes de escena durante alertas)
-    fun hayPeligroActivo(tracks: List<ObjectTrack>): Boolean {
-        // IMPORTANTE: excluir SAFE_OBJECTS — un sofá no debe declarar peligro activo
-        val danger = tracks.filter { it.label !in SAFE_OBJECTS }
-        return danger.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA } ||
-                danger.any { it.isApproaching   && it.depthScore >= DEPTH_PELIGRO }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DECISION ENGINE — Decide CUÁNDO, QUÉ y CUÁNTAS VECES hablar
-//
-// Resuelve:
-//   • Spam de mensajes repetidos → filtro por evento anterior
-//   • Múltiples instrucciones → solo 1 objeto principal por vez
-//   • Distancia irreal → convertida a "pasos"
-//   • Sin instrucción de evasión → incluida en el mensaje
-//   • No repite si el usuario ya reaccionó → usa movimiento del acelerómetro
-// ─────────────────────────────────────────────────────────────────────────────
-class DecisionEngine {
-
-    /** Evento de navegación que representa UNA instrucción concreta */
-    data class NavigationEvent(
-        val objectId: Int,
-        val label: String,
-        val zone: String,
-        val dangerLevel: Int,
-        val action: String,     // texto ya generado de la instrucción
-        val timestamp: Long
-    )
-
-    private var lastEvent: NavigationEvent? = null
-    private var lastSpeakTime: Long = 0L
-
-    // ── Resultado que devuelve DecisionEngine.process() ───────────────────────
-    data class SpeakDecision(
-        val message: String,
-        val priority: EventPriority,
-        val vibrateMs: Long = 0L,
-        val requestScan: Boolean = false
-    )
-
-    // ── Convierte profundidad ajustada a "pasos" (UX humana) ──────────────────
-    private fun depthToSteps(depth: Float): Int = when {
-        depth >= 0.75f -> 1
-        depth >= 0.60f -> 2
-        depth >= 0.45f -> 3
-        depth >= 0.30f -> 5
-        else           -> 7
-    }
-
-    // ── Instrucción de evasión según zona y disponibilidad de caminos ─────────
-    private fun getAvoidance(zone: String, lClear: Boolean, rClear: Boolean): String = when {
-        zone == "izquierda"    -> "muévete a la derecha"
-        zone == "derecha"      -> "muévete a la izquierda"
-        lClear && !rClear      -> "gira a la izquierda"
-        rClear && !lClear      -> "gira a la derecha"
-        lClear                 -> "gira a la izquierda"
-        rClear                 -> "gira a la derecha"
-        else                   -> "detente"
-    }
-
-    // ── ¿Debo hablar ahora? — compara con el evento anterior ─────────────────
-    private fun shouldSpeak(newEvent: NavigationEvent): Boolean {
-        val last = lastEvent ?: return true
-        // Mismo objeto + misma zona + misma acción + nivel de peligro sin cambio → NO repetir
-        if (last.objectId == newEvent.objectId &&
-            last.zone == newEvent.zone &&
-            last.action == newEvent.action &&
-            kotlin.math.abs(newEvent.dangerLevel - last.dangerLevel) < 1
-        ) return false
-        return true
-    }
-
-    /**
-     * Función principal. Recibe los tracks activos y decide si hablar,
-     * qué decir y con qué prioridad.
-     *
-     * @param tracks       Lista de objetos rastreados actualmente
-     * @param lastMotionTime Timestamp del último movimiento del usuario (acelerómetro)
-     * @param now          Timestamp actual
-     */
-    fun process(
-        tracks: List<ObjectTrack>,
-        lastMotionTime: Long,
-        now: Long
-    ): SpeakDecision? {
-
-        // ── Sin tracks confiables → nada que decir ────────────────────────────
-        // CAMBIO: objetos con depthScore alto avisan desde el frame 1, sin esperar confirmación
-        val FAST_WARN_LABELS = setOf("car","truck","bus","motorcycle","bicycle","person","dog",
-            "chair","couch","dining table","bed","bench","toilet","potted plant")
-        val confirmed = tracks.filter {
-            it.framesTracked >= 2 ||
-                    (it.label in FAST_WARN_LABELS && it.depthScore >= DEPTH_CERCA) ||
-                    (it.depthScore >= DEPTH_PELIGRO)  // cualquier objeto muy cerca avisa de inmediato
-        }
-        Log.d(TAG, "DECISION tracks=${tracks.size} confirmed=${confirmed.size} labels=${confirmed.map{"${it.label}(d=${"%.2f".format(it.depthScore)},z=${it.zone})"}}")
-        if (confirmed.isEmpty()) return null
-
-        // ── FILTRO DE OBJETOS SEGUROS ─────────────────────────────────────────
-        // Los objetos de interior (sofás, mesas, TV...) nunca activan alarma de evasión.
-        // Solo se convierten en "obstáculo genérico" si están EXTREMADAMENTE cerca (>= DEPTH_PELIGRO).
-        val actionableTracks = confirmed.filter { it.label !in SAFE_OBJECTS }
-        val safeTracks       = confirmed.filter { it.label in SAFE_OBJECTS }
-
-        // Objetos seguros que están físicamente muy cerca → obstáculo genérico sin nombre alarmante
-        val safeBlockers = safeTracks.filter { it.depthScore >= DEPTH_PELIGRO }
-
-        // Lista final para tomar decisiones: objetos peligrosos + bloqueadores genéricos
-        val tracksParaDecision = when {
-            actionableTracks.isNotEmpty() -> actionableTracks
-            safeBlockers.isNotEmpty()     ->
-                // Tratar como obstáculo genérico de nivel 2 — no gritar "sofá peligroso"
-                safeBlockers.map { it.copy(label = "obstacle", dangerLevel = minOf(it.dangerLevel, 2)) }
-            else -> {
-                // Solo hay muebles lejos → silencio. NO decir "camino libre" si no hubo peligro previo
-                // (evita decirlo justo cuando ya pasaste el obstáculo)
-                val lastWasDangerous = lastEvent?.let { it.dangerLevel >= 2 } ?: false
-                val timeSinceLastSpeak = now - lastSpeakTime
-                if (lastWasDangerous && timeSinceLastSpeak < 2_000L) {
-                    Log.d(TAG, "SILENCIO: esperando 2s antes de decir camino libre")
-                    return null
-                }
-                return null
-            }
-        }
-
-        // ── Calcular qué lados están libres ───────────────────────────────────
-        val leftTracks  = tracksParaDecision.filter { it.zone == "izquierda" }
-        val rightTracks = tracksParaDecision.filter { it.zone == "derecha"   }
-        val lClear = leftTracks.none  { it.depthScore >= DEPTH_CERCA }
-        val rClear = rightTracks.none { it.depthScore >= DEPTH_CERCA }
-
-        // ── Seleccionar 1 SOLO objeto principal ───────────────────────────────
-        // Prioridad: mayor dangerLevel → si empatan, mayor depthScore (más cercano)
-        val mainTrack = tracksParaDecision
-            .sortedWith(compareByDescending<ObjectTrack> { it.dangerLevel }
-                .thenByDescending { it.depthScore })
-            .firstOrNull() ?: return null
-
-        // ── ANÁLISIS DEL PASILLO COMPLETO ─────────────────────────────────────
-        // La instrucción describe por dónde CAMINAR, no solo qué objeto hay
-        val centerClear = mainTrack.zone != "centro" || mainTrack.depthScore < DEPTH_CERCA
-
-        val instruccionPasillo = when {
-            // Centro bloqueado → indicar por dónde desviar
-            !centerClear -> when {
-                lClear && rClear  -> "Desvíate a la izquierda o derecha."
-                lClear && !rClear -> "Gira a la izquierda."
-                rClear && !lClear -> "Gira a la derecha."
-                else              -> "Detente. Busca otro camino."  // activará escaneo
-            }
-            // Centro libre pero laterales ocupados → informar y seguir por centro
-            else -> {
-                val advertencias = mutableListOf<String>()
-                if (!lClear) advertencias.add("objeto a la izquierda")
-                if (!rClear) advertencias.add("objeto a la derecha")
-                if (advertencias.isNotEmpty())
-                    "${advertencias.joinToString(", ")}. Sigue por el centro."
-                else
-                    "Camino libre. Avanza."
-            }
-        }
-
-        val label     = if (mainTrack.label == "obstacle") "obstáculo"
-        else LABEL_ES[mainTrack.label]?.short ?: mainTrack.label
-        val zone      = mainTrack.zone
-        val danger    = mainTrack.dangerLevel
-        val steps     = depthToSteps(mainTrack.depthScore)
-
-        // ── Construir mensaje según nivel de peligro ──────────────────────────
-        val requestScan = !centerClear && !lClear && !rClear
-
-        val (msg, priority, vibrateMs) = when {
-            danger >= 4 -> Triple(
-                "¡Detente! $label muy cerca. ${if(!centerClear) instruccionPasillo else ""}".trim(),
-                EventPriority.CRITICO, 1000L
-            )
-            danger >= 3 -> Triple(
-                if (!centerClear)
-                    "Detente. $label al $zone a $steps paso${if(steps>1)"s" else ""}. $instruccionPasillo"
-                else
-                    instruccionPasillo,
-                EventPriority.PELIGRO_INMEDIATO, 700L
-            )
-            danger >= 2 -> Triple(
-                if (!centerClear)
-                    "$label al $zone, a $steps pasos. $instruccionPasillo"
-                else
-                    instruccionPasillo,
-                EventPriority.NAVEGACION_URGENTE, 300L
-            )
-            danger >= 1 -> Triple(
-                instruccionPasillo,
-                EventPriority.NAVEGACION_NORMAL, 0L
-            )
-            else -> Triple(
-                instruccionPasillo,
-                EventPriority.CONTEXTO, 0L
-            )
-        }
-
-        // ── Construir evento para comparar con el anterior ────────────────────
-        val newEvent = NavigationEvent(
-            objectId   = mainTrack.id,
-            label      = label,
-            zone       = zone,
-            dangerLevel = danger,
-            action     = instruccionPasillo,
-            timestamp  = now
-        )
-
-        // ── Decidir si hablar ─────────────────────────────────────────────────
-        val userMoved     = (now - lastMotionTime) < 3_000L
-        val isHighDanger  = danger >= 3
-        val timeSinceLast = now - lastSpeakTime
-
-        val speak = when {
-            // Peligro crítico/inmediato → siempre interrumpe
-            isHighDanger && timeSinceLast > COOLDOWN_PELIGRO -> true
-            // Evento nuevo (objeto o instrucción cambió) → hablar
-            shouldSpeak(newEvent) -> true
-            // El usuario no se movió en X segundos → repetir la instrucción
-            !userMoved && timeSinceLast > REPEAT_IF_NO_MOVE_MS -> true
-            // Mismo evento, usuario respondió o cooldown no expiró → silencio
-            else -> false
-        }
-
-        if (!speak) return null
-
-        Log.d(TAG, "SPEAK danger=$danger zone=$zone label=$label msg='$msg'")
-
-        // ── Guardar estado y retornar ─────────────────────────────────────────
-        lastEvent     = newEvent
-        lastSpeakTime = now
-
-        return SpeakDecision(msg, priority, vibrateMs, requestScan)
-    }
-
-    fun reset() {
-        lastEvent = null
-        lastSpeakTime = 0L
     }
 }
 
@@ -1040,9 +875,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: DetectionOverlay
     private lateinit var scanModeLabel: TextView
+    private lateinit var settingsBtn: ImageButton
     private lateinit var tts: TextToSpeech
     @Volatile private var ttsReady = false
     private lateinit var ttsQueue: TtsPriorityQueue
+    private lateinit var sessionManager: SessionManager
 
     private var camera: Camera? = null
     private lateinit var vibrator: Vibrator
@@ -1063,27 +900,58 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     @Volatile private var lastMotionTime = System.currentTimeMillis()
 
     // Estado de escaneo con giroscopio
-    private var scanModeActive    = false
-    private var scanStartTime     = 0L
-    private var scanStartAngle    = 0f   // ángulo inicial al pedir escaneo
-    private var scanMaxAngle      = 0f   // máximo ángulo barrido
-    private var lastScanRequest   = 0L
-    private var gyroAngleZ        = 0f   // ángulo acumulado del giroscopio
+    private var scanModeActive      = false
+    private var scanStartTime       = 0L
+    private var scanStartAngle      = 0f
+    private var scanMaxAngle        = 0f
+    private var lastScanRequest     = 0L
+    private var gyroAngleZ          = 0f
+    // true cuando el escaneo acaba de terminar y hay que verificar si seguimos bloqueados
+    private var postScanCheckPending = false
 
     // Timestamps
-    private var lastSpeakTime   = 0L
-    private var lastStillTime   = 0L
-    private var lastSceneTime   = 0L
-    private var lastCrossTime   = 0L
+    private var lastSpeakTime       = 0L
+    private var lastStillTime       = 0L
+    private var lastSceneTime       = 0L
+    private var lastCrossTime       = 0L
+    private var lastWallTime        = 0L
+    private var lastStairsTime      = 0L
+    private var lastObstacleTime    = 0L
+    private var lastStreetGuideTime = 0L
 
-    // Decision Engine — cerebro de navegación
+    // Tracking de tipo de escena para detectar cambios de entorno
+    private var lastSceneType: SceneType = SceneType.DESCONOCIDO
+    private var lastSceneAnnounceTime: Long = 0L
+
+    // Decision Engine — cerebro de navegación principal
     private val decisionEngine = DecisionEngine()
 
     // Descripción inicial del entorno
-    private var entornoDescrito = false
+    private var entornoDescrito   = false
     private var framesParaEntorno = 0
 
-    private var frameCount = 0  // agregar esta variable a MainActivity
+    private var frameCount = 0
+
+    // ── Gemini — consultor ocasional ─────────────────────────────────────────
+    // ⚠️ Reemplaza TU_API_KEY con tu clave de Google AI Studio antes de compilar
+    private val gemini = GeminiAdvisor(apiKey = "AIzaSyCl49xEMRKk6EF1x2T-5Emrtf5P_r0PRPk")
+    private lateinit var userPrefs: UserPreferences
+
+    // Timestamps de control de Gemini
+    private var lastGeminiSceneTime = 0L   // última vez que actualizarEscena() habló
+    private var ultimaDescGemini    = ""   // última descripción dada, para detectar cambios
+
+    // Detector de oscilación de etiquetas YOLO (para confirmarObjeto)
+    private var labelOscilacion1  = ""
+    private var labelOscilacion2  = ""
+    private var labelOscilacionTs = 0L
+    private var labelOscilacionId = -1
+
+    // Flag para no lanzar coroutines Gemini simultáneas
+    @Volatile private var geminiRunning = false
+
+    // Copia del último frame para pasarla a Gemini
+    @Volatile private var latestBitmap: Bitmap? = null
 
     // Pipeline
     private val cameraExecutor = Executors.newSingleThreadExecutor()
@@ -1097,9 +965,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        previewView  = findViewById(R.id.viewFinder)
-        overlay      = findViewById(R.id.detectionOverlay)
+        previewView   = findViewById(R.id.viewFinder)
+        overlay       = findViewById(R.id.detectionOverlay)
         scanModeLabel = findViewById(R.id.scanModeLabel)
+        settingsBtn   = findViewById(R.id.settingsBtn)
+
+        userPrefs = UserPreferences(this)
+        sessionManager = SessionManager(this, lifecycleScope)
 
         @Suppress("DEPRECATION")
         vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1112,18 +984,41 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         accel = sensorMgr.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyro  = sensorMgr.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
+        settingsBtn.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         initModels()
         initTts()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) startCamera()
-        else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 10)
+            == PackageManager.PERMISSION_GRANTED) {
+            startCamera()
+            requestGpsPermissionIfNeeded()
+        } else {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.CAMERA,
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION),
+                10
+            )
+        }
     }
 
     override fun onResume() {
         super.onResume()
         accel?.let { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
         gyro?.let  { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        // Aplicar cambios de preferencias que el usuario pudo haber cambiado en Settings
+        if (::ttsQueue.isInitialized) {
+            ttsQueue.userSpeedMultiplier = userPrefs.getSpeechRate()
+            ttsQueue.userPitch           = userPrefs.getPitch()
+        }
+        // El sistema puede apagar el flash al pausar; resetear estado para re-evaluar.
+        isTorchOn = false
+        lastTorchChg = 0L
+        brightHistory.clear()
     }
     override fun onPause() { super.onPause(); sensorMgr.unregisterListener(this) }
 
@@ -1138,6 +1033,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 // Acumular rotación en Z (yaw = girar el teléfono horizontalmente)
                 val dt = 0.02f  // ~50Hz SENSOR_DELAY_GAME
                 gyroAngleZ += Math.toDegrees(event.values[2].toDouble()).toFloat() * dt
+
+                // Girar/apuntar la cámara cuenta como ACTIVIDAD. Antes solo el
+                // acelerómetro reseteaba la quietud, así que mover la cámara sin
+                // caminar disparaba la pausa y CONGELABA las cajas ~12s.
+                val rotRate = sqrt(event.values[0].pow(2) + event.values[1].pow(2) + event.values[2].pow(2))
+                if (rotRate > 0.15f) lastMotionTime = System.currentTimeMillis()
 
                 if (scanModeActive) {
                     val angleMoved = abs(gyroAngleZ - scanStartAngle)
@@ -1173,12 +1074,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun completeScan() {
         scanModeActive = false
+        postScanCheckPending = true
         runOnUiThread { scanModeLabel.visibility = View.GONE }
-        // El siguiente frame de detección ya mostrará lo que vio al girar
     }
 
     private fun cancelScan() {
         scanModeActive = false
+        postScanCheckPending = true
         runOnUiThread { scanModeLabel.visibility = View.GONE }
     }
 
@@ -1199,10 +1101,54 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)
                     tts.setLanguage(java.util.Locale("es"))
                 ttsReady = true
-                ttsQueue  = TtsPriorityQueue(tts)
+                ttsQueue = TtsPriorityQueue(tts).also {
+                    it.userSpeedMultiplier = userPrefs.getSpeechRate()
+                    it.userPitch           = userPrefs.getPitch()
+                }
+                selectBestVoice()
                 speak("Iniciando sistema. Analizando entorno...", EventPriority.CONTEXTO)
+                // Iniciar sesión en DB una vez que el sistema está listo
+                sessionManager.startSession(userPrefs)
             } else Log.e(TAG, "TTS falló: $status")
         }
+    }
+
+    /** Selecciona la voz española de mayor calidad disponible en el dispositivo.
+     *  Las voces "enhanced" de Google TTS suenan significativamente más naturales.
+     *  Un pitch ligeramente más bajo (0.92) reduce el sonido robótico. */
+    private fun selectBestVoice() {
+        val allVoices = tts.voices ?: return
+
+        // Si el usuario eligió una voz específica en Settings, usarla
+        val savedName = userPrefs.vozNombre
+        if (savedName.isNotEmpty()) {
+            val savedVoice = allVoices.firstOrNull { it.name == savedName }
+            if (savedVoice != null) {
+                tts.voice = savedVoice
+                Log.d(TAG, "TTS voz guardada: ${savedVoice.name}")
+                tts.setPitch(1.0f)
+                return
+            }
+        }
+
+        // Auto-selección: mejor voz española disponible
+        val best = allVoices
+            .filter { v ->
+                v.locale.language == "es" &&
+                !v.features.contains(android.speech.tts.TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+            }
+            .minByOrNull { v ->
+                when {
+                    v.quality >= android.speech.tts.Voice.QUALITY_VERY_HIGH -> -2000 + v.latency
+                    v.quality >= android.speech.tts.Voice.QUALITY_HIGH      -> -1000 + v.latency
+                    else                                                     ->  10000 + v.latency
+                }
+            }
+        if (best != null) {
+            tts.voice = best
+            Log.d(TAG, "TTS voz auto: ${best.name} calidad=${best.quality} latencia=${best.latency}ms")
+        }
+        tts.setPitch(1.0f)
     }
 
     // ── CameraX ───────────────────────────────────────────────────────────────
@@ -1226,13 +1172,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                 controlTorch(rotated)
 
-                // DESPUÉS — MiDaS cada 3 frames
+                // Guardar copia ligera del frame actual para Gemini
+                // (solo se usa cuando Gemini es invocado, no en cada frame)
+                val prevBitmap = latestBitmap
+                latestBitmap = rotated.copy(rotated.config ?: Bitmap.Config.ARGB_8888, false)
+                prevBitmap?.recycle()
 
-                // dentro del analyzer:
+                // MiDaS cada 4 frames
                 frameCount++
-                if (depthAvailable.get() && frameCount % 3 == 0) depthExecutor.execute {
-                    latestDepth = depthEstimator?.estimate(rotated)
-                    depthTs     = System.currentTimeMillis()
+                if (depthAvailable.get() && frameCount % 4 == 0) {
+                    val bmpCopy = rotated.copy(rotated.config ?: Bitmap.Config.ARGB_8888, false)
+                    depthExecutor.execute {
+                        latestDepth = depthEstimator?.estimate(bmpCopy)
+                        depthTs     = System.currentTimeMillis()
+                        bmpCopy.recycle()
+                    }
+
                 }
 
                 val t0 = System.currentTimeMillis()
@@ -1242,12 +1197,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val depthAge = now - depthTs
                 val depthMap = if (depthAge < 1200L) latestDepth else null
                 Log.d(TAG, "FRAME yolo=${yoloMs}ms dets=${detections.size} depthAge=${depthAge}ms depthOk=${depthMap != null}")
-
-                // Actualizar overlay visual (para demo en clase)
-                val overlayData = detections.map { d ->
-                    d.box to Pair(d.label, d.score)
-                }
-                overlay.update(overlayData, rotated.width, rotated.height)
 
                 processFrame(detections, depthMap, now)
             }
@@ -1275,23 +1224,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val labels = tracks.map { it.label }
         Log.d(TAG, "TRACKS total=${tracks.size} labels=${labels.distinct()}")
 
+        // Overlay con tracks estables (IDs fijos → sin temblor)
+        overlay.update(tracks)
+
         // ── DESCRIPCIÓN INICIAL DEL ENTORNO ───────────────────────────────────
         // Espera 5 frames para tener detecciones estables, luego describe el entorno
         if (!entornoDescrito) {
             framesParaEntorno++
-            if (framesParaEntorno >= 5 && labels.isNotEmpty()) {
+            if (framesParaEntorno >= 5 && (labels.isNotEmpty() || framesParaEntorno >= 20)) {
                 describirEntornoInicial(labels, tracks)
                 entornoDescrito = true
             }
             return  // No navegar hasta describir el entorno
         }
 
-        checkCrossing(labels, now)
+        checkCrossing(tracks, labels, now)
+
+        // Detectar cambio de entorno y guía de cruce en calle
+        val areas = tracks.map { it.box.width() * it.box.height() }
+        checkSceneChange(inferScene(labels, areas), tracks, labels, now)
 
         // ── DECISION ENGINE — única fuente de verdad para hablar ─────────────
         // Selecciona 1 objeto principal, construye mensaje con pasos + evasión,
         // filtra repeticiones y repite solo si el usuario no reaccionó.
-        val speakDecision = decisionEngine.process(tracks, lastMotionTime, now)
+        val speakDecision = decisionEngine.process(tracks, lastMotionTime, now, userPrefs.getDepthThreshold())
 
         if (speakDecision != null) {
             speak(speakDecision.message, speakDecision.priority)
@@ -1300,60 +1256,193 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             lastSpeakTime = now
         }
 
+        // ── POST-SCAN: si el escaneo terminó y seguimos bloqueados → Gemini ─────
+        if (postScanCheckPending && !geminiRunning) {
+            postScanCheckPending = false
+            if (speakDecision?.requestScan == true) {
+                intentarSalidaConGemini(tracks, now)
+            }
+        }
+
+        // ── ESCALONES (peligro de caída) ──────────────────────────────────────
+        // Se evalúa SIEMPRE y con prioridad alta para que pueda interrumpir.
+        // Antes estaba bloqueado tras speakDecision==null y !tts.isSpeaking, por
+        // eso el aviso llegaba ~10s tarde (cuando ya habías pasado el escalón).
+        if (now - lastStairsTime > 6_000L && detectEscalonesAdelante(depthMap)) {
+            speak("¡Cuidado! Posible escalón adelante.", EventPriority.PELIGRO_INMEDIATO)
+            vibrate(400L)
+            lastStairsTime = now
+        }
+
+        // ── OBSTÁCULO/PARED SIN ETIQUETA YOLO ────────────────────────────────
+        // Cubre gavetero, mesita, pared, esquina — cualquier bloqueo que YOLO
+        // no reconoció. Se evalúa siempre que el centro no tenga track YOLO.
+        // Excluir SAFE_OBJECTS: frutas/comida en el centro no deben bloquear la detección sin etiqueta.
+        val centerCoveredByYolo = tracks.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA && it.label !in SAFE_OBJECTS }
+        if (!centerCoveredByYolo && now - lastObstacleTime > 2_800L) {
+            val isPared  = detectParedAlFrente(depthMap)
+            val obsDepth = if (!isPared) detectObstaculoCercanoSinYolo(depthMap) else 0f
+            when {
+                isPared && now - lastWallTime > 7_000L -> {
+                    speak("Camino obstruido. Detente.", EventPriority.PELIGRO_INMEDIATO)
+                    vibrate(350L); lastWallTime = now; lastObstacleTime = now
+                }
+                obsDepth >= DEPTH_PELIGRO -> {
+                    val prio = if (obsDepth >= DEPTH_CRITICO) EventPriority.PELIGRO_INMEDIATO
+                               else EventPriority.NAVEGACION_URGENTE
+                    speak("Objeto al frente.", prio)
+                    vibrate(if (prio == EventPriority.PELIGRO_INMEDIATO) 400L else 200L)
+                    lastObstacleTime = now
+                }
+                obsDepth >= DEPTH_CERCA -> {
+                    speak("Algo al frente. Avanza con cuidado.", EventPriority.NAVEGACION_NORMAL)
+                    lastObstacleTime = now
+                }
+            }
+        }
+
         // Descripción periódica del entorno — SOLO si no hay peligro activo y
         // el Decision Engine está en silencio
         val peligroActivo = NavigationEngine.hayPeligroActivo(tracks)
         if (!peligroActivo && speakDecision == null
             && !tts.isSpeaking && now - lastSceneTime > COOLDOWN_ESCENA) {
-            val areas = tracks.map { it.box.width() * it.box.height() }
-            val scene = inferScene(labels, areas)
-            val msg   = buildSceneMessage(scene, labels)
-            if (msg != null) { speak(msg, EventPriority.CONTEXTO); lastSceneTime = now }
+            // Gemini intenta actualizar la escena; si falla cae a buildSceneMessage local
+            intentarActualizarEscenaConGemini(labels, tracks, now)
         }
+
+        // Detector de oscilación de etiquetas YOLO — llama confirmarObjeto() si oscila
+        checkLabelOscilacion(tracks, now)
     }
 
     /**
+     * Detecta cuando un mismo objeto (mismo trackId) alterna entre 2 etiquetas
+     * distintas en menos de 2 segundos. En ese caso pide a Gemini que confirme.
+     */
+    private fun checkLabelOscilacion(tracks: List<ObjectTrack>, now: Long) {
+        if (geminiRunning) return
+
+        for (track in tracks) {
+            val id    = track.id
+            val label = track.label
+
+            if (id == labelOscilacionId) {
+                // Mismo objeto — ¿cambió de etiqueta?
+                if (label != labelOscilacion1 && label != labelOscilacion2) {
+                    // Nueva etiqueta distinta — reiniciar
+                    labelOscilacion1  = label
+                    labelOscilacion2  = ""
+                    labelOscilacionTs = now
+                } else if (label != labelOscilacion1 && labelOscilacion2.isEmpty()) {
+                    // Segunda etiqueta distinta detectada
+                    labelOscilacion2  = label
+                    labelOscilacionTs = now
+                } else if (labelOscilacion2.isNotEmpty()
+                    && label == labelOscilacion1
+                    && now - labelOscilacionTs < 2_000L) {
+                    // Oscilación confirmada: alterna entre label1 y label2 en <2s
+                    val l1 = labelOscilacion1
+                    val l2 = labelOscilacion2
+                    val bmpCopy = latestBitmap?.copy(latestBitmap!!.config ?: Bitmap.Config.ARGB_8888, false)
+                    if (bmpCopy != null) {
+                        geminiRunning = true
+                        lifecycleScope.launch {
+                            val confirmado = gemini.confirmarObjeto(bmpCopy, l1, l2)
+                            bmpCopy.recycle()
+                            if (confirmado != null) {
+                                Log.d(TAG, "GEMINI confirmo objeto: $l1/$l2 → $confirmado")
+                                // No habla aquí — el DecisionEngine usará el label correcto
+                                // en el próximo frame cuando YOLO lo reclasifique
+                            }
+                            geminiRunning = false
+                        }
+                    }
+                    // Resetear para no disparar de nuevo inmediatamente
+                    labelOscilacion1  = ""
+                    labelOscilacion2  = ""
+                    labelOscilacionId = -1
+                    break
+                }
+            } else {
+                // Nuevo objeto que no estábamos siguiendo
+                if (labelOscilacion1.isEmpty()) {
+                    labelOscilacion1  = label
+                    labelOscilacionId = id
+                    labelOscilacionTs = now
+                }
+            }
+        }
+    }   // ← cierre de checkLabelOscilacion
+
+    /**
      * Primera descripción del entorno al arrancar.
-     * Responde: ¿Dónde estoy? ¿Hay espacio? ¿Qué hay cerca?
+     * Intenta llamar a Gemini (1 sola vez por sesión).
+     * Si Gemini falla o hay timeout → usa la descripción local original como fallback.
      */
     private fun describirEntornoInicial(labels: List<String>, tracks: List<ObjectTrack>) {
-        val areas = tracks.map { it.box.width() * it.box.height() }
-        val scene = inferScene(labels, areas)
-        val veh   = labels.count { it in VEHICLES }
-        val per   = labels.count { it == "person" }
-        val totalObjs = labels.size
+        if (geminiRunning) return
+        geminiRunning = true
 
-        val entorno = when (scene) {
-            SceneType.COCINA              -> "Pareces estar en una cocina."
-            SceneType.HABITACION          -> "Pareces estar en una habitación."
-            SceneType.SALA                -> "Pareces estar en una sala."
-            SceneType.BANO                -> "Pareces estar en un baño."
-            SceneType.OFICINA             -> "Pareces estar en una oficina o estudio."
-            SceneType.INTERIOR_DESPEJADO  -> "Pareces estar en un lugar cerrado con espacio disponible."
-            SceneType.INTERIOR_CONCURRIDO ->
-                if (per >= 3) "Estás en un lugar cerrado con $per personas cerca."
-                else "Estás en un espacio interior con varios objetos."
-            SceneType.EXTERIOR_TRANQUILO  ->
-                if (veh > 0) "Estás en exteriores. Hay $veh vehículo${if(veh>1)"s" else ""} en la zona."
-                else "Estás en exteriores con espacio abierto."
-            SceneType.EXTERIOR_CONCURRIDO -> "Estás en exteriores con mucha actividad alrededor."
-            SceneType.CRUCE_PELIGROSO     -> "Detecté una intersección o cruce. Precaución extrema."
-            SceneType.DESCONOCIDO         ->
-                if (totalObjs == 0) "No detecto objetos cercanos. El camino parece libre."
-                else "Analizando el entorno. Detecto $totalObjs objeto${if(totalObjs>1)"s" else ""}."
+        val bmpCopy      = latestBitmap?.copy(latestBitmap!!.config ?: Bitmap.Config.ARGB_8888, false)
+        val labelCercano = tracks.filter { it.label !in SAFE_OBJECTS }
+            .maxByOrNull { it.depthScore }?.label
+
+        lifecycleScope.launch {
+            var respuesta: String? = null
+
+            // Intentar con Gemini solo si tenemos imagen
+            if (bmpCopy != null) {
+                respuesta = gemini.describirEntornoInicial(bmpCopy, labels, labelCercano)
+                bmpCopy.recycle()
+            }
+
+            if (respuesta != null) {
+                // Gemini respondió — usar su descripción natural
+                ultimaDescGemini = respuesta
+                speak(respuesta, EventPriority.CONTEXTO)
+                Log.d(TAG, "GEMINI entorno inicial: $respuesta")
+            } else {
+                // Fallback local — la lógica original sin cambios
+                val areas = tracks.map { it.box.width() * it.box.height() }
+                val scene = inferScene(labels, areas)
+                val veh   = labels.count { it in VEHICLES }
+                val per   = labels.count { it == "person" }
+                val total = labels.size
+
+                val entorno = when (scene) {
+                    SceneType.COCINA              -> "Pareces estar en una cocina."
+                    SceneType.HABITACION          -> "Pareces estar en una habitación."
+                    SceneType.SALA                -> "Pareces estar en una sala."
+                    SceneType.BANO                -> "Pareces estar en un baño."
+                    SceneType.OFICINA             -> "Pareces estar en una oficina o estudio."
+                    SceneType.INTERIOR_DESPEJADO  -> "Pareces estar en un lugar cerrado con espacio disponible."
+                    SceneType.INTERIOR_CONCURRIDO ->
+                        if (per >= 3) "Estás en un lugar cerrado con $per personas cerca."
+                        else "Estás en un espacio interior con varios objetos."
+                    SceneType.EXTERIOR_TRANQUILO  ->
+                        if (veh > 0) "Estás en exteriores. Hay $veh vehículo${if(veh>1)"s" else ""} en la zona."
+                        else "Estás en exteriores con espacio abierto."
+                    SceneType.EXTERIOR_CONCURRIDO -> "Estás en exteriores con mucha actividad alrededor."
+                    SceneType.CRUCE_PELIGROSO     -> "Detecté una intersección o cruce. Precaución extrema."
+                    SceneType.DESCONOCIDO         ->
+                        if (total == 0) "No detecto objetos cercanos. El camino parece libre."
+                        else "Analizando el entorno. Detecto $total objeto${if(total>1)"s" else ""}."
+                }
+                val masUrgente = tracks.filter { it.depthScore >= DEPTH_AVISO && it.label !in SAFE_OBJECTS }
+                    .maxByOrNull { it.depthScore }
+                val sufijo = if (masUrgente != null) {
+                    val obj = LABEL_ES[masUrgente.label]?.short ?: masUrgente.label
+                    " Hay ${LABEL_ES[masUrgente.label]?.let { "${it.art} $obj" } ?: obj} al ${masUrgente.zone}."
+                } else ""
+
+                val msg = "$entorno$sufijo"
+                ultimaDescGemini = msg
+                speak(msg, EventPriority.CONTEXTO)
+                Log.d(TAG, "FALLBACK entorno inicial: $msg")
+            }
+
+            lastSceneTime   = System.currentTimeMillis()
+            geminiRunning   = false
         }
-
-        // Agregar objetos más cercanos
-        // Solo mencionar objetos peligrosos reales, nunca muebles/electrodomésticos
-        val masUrgente = tracks.filter { it.depthScore >= DEPTH_AVISO && it.label !in SAFE_OBJECTS }
-            .maxByOrNull { it.depthScore }
-        val sufijo = if (masUrgente != null) {
-            val obj = LABEL_ES[masUrgente.label]?.short ?: masUrgente.label
-            " Hay ${LABEL_ES[masUrgente.label]?.let { "${it.art} $obj" } ?: obj} al ${masUrgente.zone}."
-        } else ""
-
-        speak("$entorno$sufijo", EventPriority.CONTEXTO)
-        lastSceneTime = System.currentTimeMillis()
     }
 
     private fun buildSceneMessage(scene: SceneType, labels: List<String>): String? {
@@ -1374,19 +1463,251 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
-    private fun checkCrossing(labels: List<String>, now: Long) {
-        if (now - lastCrossTime < COOLDOWN_CRUCE) return
-        if ((labels.contains("traffic light") || labels.contains("stop sign"))
-            && labels.count { it in CROSSING_HINTS } >= 2) {
-            speak("Cruce detectado. Detente y escanea los lados.", EventPriority.NAVEGACION_URGENTE)
-            vibrate(500L)
-            startScanMode("la izquierda y luego la derecha")
-            lastCrossTime = now
+    /**
+     * Actualización periódica de escena — intenta Gemini, cae a buildSceneMessage() si falla.
+     * Solo se llama cuando no hay peligro activo y el DecisionEngine está en silencio.
+     * Gemini solo habla si detecta un cambio real respecto a la última descripción dada.
+     */
+    private fun intentarActualizarEscenaConGemini(labels: List<String>, tracks: List<ObjectTrack>, now: Long) {
+        if (geminiRunning) return
+        if (now - lastGeminiSceneTime < COOLDOWN_ESCENA) return
+        geminiRunning = true
+
+        val bmpCopy = latestBitmap?.copy(latestBitmap!!.config ?: Bitmap.Config.ARGB_8888, false)
+
+        lifecycleScope.launch {
+            var respondioGemini = false
+
+            if (bmpCopy != null) {
+                val respuesta = gemini.actualizarEscena(bmpCopy, labels, ultimaDescGemini)
+                bmpCopy.recycle()
+
+                if (respuesta != null) {
+                    ultimaDescGemini    = respuesta
+                    lastGeminiSceneTime = System.currentTimeMillis()
+                    lastSceneTime       = System.currentTimeMillis()
+                    // Escena cambió → limpiar objetos "ya avisados" para que se anuncien de nuevo
+                    decisionEngine.resetWarnedFar()
+                    speak(respuesta, EventPriority.CONTEXTO)
+                    Log.d(TAG, "GEMINI escena actualizada: $respuesta")
+                    respondioGemini = true
+                }
+            } else {
+                bmpCopy?.recycle()
+            }
+
+            // Fallback local si Gemini no respondió o no hay imagen
+            if (!respondioGemini) {
+                val areas = tracks.map { it.box.width() * it.box.height() }
+                val scene = inferScene(labels, areas)
+                val msg   = buildSceneMessage(scene, labels)
+                if (msg != null) {
+                    ultimaDescGemini = msg
+                    lastSceneTime    = System.currentTimeMillis()
+                    speak(msg, EventPriority.CONTEXTO)
+                    Log.d(TAG, "FALLBACK escena local: $msg")
+                }
+            }
+
+            geminiRunning = false
         }
+    }
+
+    /**
+     * Llama a Gemini para sugerir una salida cuando el camino está completamente bloqueado
+     * y el escaneo lateral no encontró alternativas.
+     * Se activa máximo una vez por escaneo, con resultado hablado al usuario.
+     */
+    private fun intentarSalidaConGemini(tracks: List<ObjectTrack>, now: Long) {
+        if (geminiRunning) return
+        geminiRunning = true
+
+        val bmpCopy = latestBitmap?.copy(latestBitmap!!.config ?: Bitmap.Config.ARGB_8888, false)
+        val labelsBloq = tracks.filter { it.depthScore >= DEPTH_CERCA }
+            .map { it.label }.distinct()
+        val zonas = buildString {
+            if (tracks.any { it.zone == "centro"    && it.depthScore >= DEPTH_CERCA }) append("centro ")
+            if (tracks.any { it.zone == "izquierda" && it.depthScore >= DEPTH_CERCA }) append("izquierda ")
+            if (tracks.any { it.zone == "derecha"   && it.depthScore >= DEPTH_CERCA }) append("derecha")
+        }.trim().ifEmpty { "todas" }
+
+        lifecycleScope.launch {
+            val respuesta = if (bmpCopy != null) {
+                gemini.sugerirSalidaBloqueado(bmpCopy, labelsBloq, zonas).also { bmpCopy.recycle() }
+            } else null
+
+            val msg = respuesta ?: "Camino bloqueado. Intenta retroceder y buscar otra ruta."
+            speak(msg, EventPriority.NAVEGACION_URGENTE)
+            Log.d(TAG, "GEMINI salida bloqueado: $msg")
+            geminiRunning = false
+        }
+    }
+
+    private fun checkSceneChange(scene: SceneType, tracks: List<ObjectTrack>, labels: List<String>, now: Long) {
+        // No anunciar si acabamos de hablar de otra cosa (evitar solapamientos)
+        if (now - lastSpeakTime < 2_000L) return
+
+        // Anunciar cambio de entorno solo si cambió significativamente y pasó al menos 8s
+        val cambioSignificativo = scene != SceneType.DESCONOCIDO &&
+            scene != lastSceneType &&
+            now - lastSceneAnnounceTime > 8_000L
+
+        if (cambioSignificativo) {
+            val isNowExterior = scene == SceneType.EXTERIOR_TRANQUILO || scene == SceneType.EXTERIOR_CONCURRIDO
+            val wasInterior   = lastSceneType in setOf(SceneType.SALA, SceneType.HABITACION,
+                SceneType.COCINA, SceneType.BANO, SceneType.OFICINA, SceneType.INTERIOR_DESPEJADO,
+                SceneType.INTERIOR_CONCURRIDO)
+            val isNowInterior = scene in setOf(SceneType.SALA, SceneType.HABITACION,
+                SceneType.COCINA, SceneType.BANO, SceneType.OFICINA, SceneType.INTERIOR_DESPEJADO,
+                SceneType.INTERIOR_CONCURRIDO)
+
+            val msg = when {
+                isNowExterior -> "Pareces estar en exteriores."
+                scene == SceneType.SALA       -> "Pareces estar en una sala."
+                scene == SceneType.HABITACION -> "Pareces estar en una habitación."
+                scene == SceneType.COCINA     -> "Pareces estar en una cocina."
+                scene == SceneType.BANO       -> "Pareces estar en un baño."
+                scene == SceneType.OFICINA    -> "Pareces estar en una oficina."
+                isNowInterior && !wasInterior -> "Pareces estar en un lugar cerrado."
+                else -> null
+            }
+            if (msg != null) {
+                speak(msg, EventPriority.CONTEXTO)
+                lastSceneAnnounceTime = now
+                decisionEngine.resetWarnedFar()
+            }
+            lastSceneType = scene
+        }
+
+        // Guía de cruce en calle: cuando hay vehículos en exterior, ofrecer escaneo lateral
+        val isExterior = scene == SceneType.EXTERIOR_TRANQUILO || scene == SceneType.EXTERIOR_CONCURRIDO
+        if (isExterior && now - lastStreetGuideTime > 40_000L && !NavigationEngine.hayPeligroActivo(tracks)) {
+            val hayVehiculos = tracks.any { it.label in VEHICLES }
+            if (hayVehiculos) {
+                speak("Vehículos detectados. Mueve el teléfono a ambos lados antes de cruzar.",
+                    EventPriority.NAVEGACION_NORMAL)
+                startScanMode("ambos lados")
+                lastStreetGuideTime = now
+            }
+        }
+    }
+
+    private fun checkCrossing(tracks: List<ObjectTrack>, labels: List<String>, now: Long) {
+        if (now - lastCrossTime < COOLDOWN_CRUCE) return
+        val hayLuz   = labels.contains("traffic light")
+        val haySenal = labels.contains("stop sign")
+        if (!(hayLuz || haySenal) || labels.count { it in CROSSING_HINTS } < 2) return
+
+        // Detectar color del semáforo si hay uno visible
+        val bmp = latestBitmap
+        val colorSemaforo = if (hayLuz && bmp != null) {
+            val sf = tracks.firstOrNull { it.label == "traffic light" }
+            if (sf != null) detectSemaforoColor(bmp, sf.box) else "?"
+        } else "?"
+
+        val msg = when (colorSemaforo) {
+            "rojo"  -> "Semáforo en rojo. Espera antes de cruzar."
+            "verde" -> "Semáforo en verde. Puedes cruzar, con cuidado."
+            else    -> "Cruce detectado. Detente y escanea los lados."
+        }
+        speak(msg, EventPriority.NAVEGACION_URGENTE)
+        vibrate(500L)
+        if (colorSemaforo != "verde") startScanMode("la izquierda y luego la derecha")
+        lastCrossTime = now
+    }
+
+    /** Analiza el color dominante dentro del bbox de un semáforo.
+     *  Muestrea el tercio superior (rojo) y el tercio inferior (verde). */
+    private fun detectSemaforoColor(bitmap: Bitmap, box: RectF): String {
+        val bw = bitmap.width.toFloat(); val bh = bitmap.height.toFloat()
+        val l = (box.left  * bw).toInt().coerceIn(0, bitmap.width  - 1)
+        val t = (box.top   * bh).toInt().coerceIn(0, bitmap.height - 1)
+        val r = (box.right  * bw).toInt().coerceIn(1, bitmap.width)
+        val b = (box.bottom * bh).toInt().coerceIn(1, bitmap.height)
+        if (r - l < 4 || b - t < 4) return "?"
+
+        val h3 = ((b - t) / 3).coerceAtLeast(1)
+        var redPx = 0; var greenPx = 0; var samples = 0
+
+        for (y in t until (t + h3) step 2) for (x in l until r step 2) {
+            val p = bitmap.getPixel(x, y)
+            val rv = (p shr 16) and 0xFF; val gv = (p shr 8) and 0xFF; val bv = p and 0xFF
+            if (rv > 160 && rv > gv * 1.5f && rv > bv * 1.5f) redPx++
+            samples++
+        }
+        for (y in (b - h3) until b step 2) for (x in l until r step 2) {
+            val p = bitmap.getPixel(x, y)
+            val rv = (p shr 16) and 0xFF; val gv = (p shr 8) and 0xFF; val bv = p and 0xFF
+            if (gv > 110 && gv > rv * 1.2f && gv > bv * 1.0f) greenPx++
+        }
+        return when {
+            samples > 0 && redPx.toFloat()   / samples > 0.10f -> "rojo"
+            greenPx > 6                                         -> "verde"
+            else                                                -> "?"
+        }
+    }
+
+    /** Detecta pared cercana por mapa de profundidad: zona central con alta profundidad uniforme */
+    private fun detectParedAlFrente(depthMap: Array<FloatArray>?): Boolean {
+        if (depthMap == null) return false
+        val h = depthMap.size; val w = depthMap[0].size
+        val y0 = (h * 0.25).toInt(); val y1 = (h * 0.75).toInt()
+        val x0 = (w * 0.25).toInt(); val x1 = (w * 0.75).toInt()
+        var sum = 0f; var count = 0
+        for (y in y0 until y1 step 3) for (x in x0 until x1 step 3) { sum += depthMap[y][x]; count++ }
+        if (count == 0) return false
+        val avg = sum / count
+        var variance = 0f
+        for (y in y0 until y1 step 3) for (x in x0 until x1 step 3) {
+            val d = depthMap[y][x] - avg; variance += d * d
+        }
+        variance /= count
+        // Pared plana: alta profundidad + poca varianza
+        // Esquina: profundidad EXTREMA aunque la varianza sea mayor (dos paredes distintas)
+        return (avg > 0.74f && variance < 0.022f) || avg > 0.87f
+    }
+
+    /** Detecta obstáculo cercano no clasificado por YOLO (mesita, gavetero, silla ocluida…).
+     *  varianza ≥ 0.008 excluye superficies planas que ya cubre detectParedAlFrente.
+     *  Devuelve la profundidad promedio del centro si hay obstáculo, 0f si no. */
+    private fun detectObstaculoCercanoSinYolo(depthMap: Array<FloatArray>?): Float {
+        if (depthMap == null) return 0f
+        val h = depthMap.size; val w = depthMap[0].size
+        val y0 = (h * 0.12).toInt(); val y1 = (h * 0.82).toInt()
+        val x0 = (w * 0.22).toInt(); val x1 = (w * 0.78).toInt()
+        var sum = 0f; var count = 0
+        for (y in y0 until y1 step 3) for (x in x0 until x1 step 3) { sum += depthMap[y][x]; count++ }
+        if (count == 0) return 0f
+        val avg = sum / count
+        var variance = 0f
+        for (y in y0 until y1 step 3) for (x in x0 until x1 step 3) {
+            val d = depthMap[y][x] - avg; variance += d * d
+        }
+        variance /= count
+        return if (variance >= 0.005f) avg else 0f
+    }
+
+    /** Detecta escalones por patrón de gradiente alternante en la franja inferior del mapa */
+    private fun detectEscalonesAdelante(depthMap: Array<FloatArray>?): Boolean {
+        if (depthMap == null) return false
+        val h = depthMap.size; val w = depthMap[0].size
+        val cx = w / 2
+        val step = (h / 22).coerceAtLeast(1)
+        var transitions = 0; var prevSlope = 0f
+        var prevDepth = depthMap[(h * 0.50).toInt().coerceIn(0, h - 1)][cx]
+
+        for (yi in (h * 0.50).toInt() until (h * 0.92).toInt() step step) {
+            val depth = depthMap[yi.coerceIn(0, h - 1)][cx]
+            val slope = depth - prevDepth
+            if (abs(slope) > 0.040f && slope * prevSlope < 0f) transitions++
+            prevSlope = slope; prevDepth = depth
+        }
+        return transitions >= 2
     }
 
     // ── Vibración ─────────────────────────────────────────────────────────────
     private fun vibrate(ms: Long) {
+        if (!userPrefs.vibracionActivada) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
         else @Suppress("DEPRECATION") vibrator.vibrate(ms)
@@ -1428,17 +1749,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         lastSpeakTime = System.currentTimeMillis()
     }
 
+    private fun requestGpsPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                11
+            )
+        }
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 10 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED)
-            startCamera() else finish()
+        when (requestCode) {
+            10 -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    startCamera()
+                    requestGpsPermissionIfNeeded()
+                } else finish()
+            }
+            11 -> Unit  // GPS es opcional — SessionManager verifica el permiso al usarlo
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        sessionManager.stopSession()
         if (::tts.isInitialized) tts.shutdown()
         yoloDetector.close(); depthEstimator?.close()
         cameraExecutor.shutdown(); depthExecutor.shutdown()
         trackManager.clear()
+        latestBitmap?.recycle(); latestBitmap = null
     }
 }

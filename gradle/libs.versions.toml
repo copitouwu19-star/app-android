@@ -1,6 +1,8 @@
 [versions]
 agp              = "8.3.2"
 kotlin           = "1.9.24"
+ksp              = "1.9.24-1.0.20"
+room             = "2.6.1"
 coreKtx          = "1.12.0"
 appcompat        = "1.6.1"
 constraintlayout = "2.1.4"
@@ -24,6 +26,9 @@ tflite                    = { group = "org.tensorflow",            name = "tenso
 tflite-gpu                = { group = "org.tensorflow",            name = "tensorflow-lite-gpu",    version.ref = "tflite"                }
 tflite-support            = { group = "org.tensorflow",            name = "tensorflow-lite-support", version.ref = "tflite-support"       }
 coroutines-android        = { group = "org.jetbrains.kotlinx",     name = "kotlinx-coroutines-android", version.ref = "coroutines"       }
+room-runtime              = { group = "androidx.room",             name = "room-runtime",           version.ref = "room"                  }
+room-ktx                  = { group = "androidx.room",             name = "room-ktx",               version.ref = "room"                  }
+room-compiler             = { group = "androidx.room",             name = "room-compiler",          version.ref = "room"                  }
 junit                     = { group = "junit",                     name = "junit",                  version.ref = "junit"                 }
 androidx-test-ext         = { group = "androidx.test.ext",         name = "junit",                  version.ref = "androidx-test-ext"     }
 androidx-test-espresso    = { group = "androidx.test.espresso",    name = "espresso-core",          version.ref = "androidx-test-espresso"}
@@ -31,3 +36,4 @@ androidx-test-espresso    = { group = "androidx.test.espresso",    name = "espre
 [plugins]
 android-application = { id = "com.android.application",      version.ref = "agp"    }
 kotlin-android      = { id = "org.jetbrains.kotlin.android",  version.ref = "kotlin" }
+ksp                 = { id = "com.google.devtools.ksp",        version.ref = "ksp"    }

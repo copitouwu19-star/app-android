@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#1A1A2E">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- Título -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Configuración"
+            android:textColor="#FFFFFF"
+            android:textSize="26sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="28dp" />
+
+        <!-- ── Sección: Vibración ─────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Vibración"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#2A2A4E"
+            android:padding="16dp"
+            android:layout_marginBottom="24dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Activar vibración en alertas"
+                android:textColor="#FFFFFF"
+                android:textSize="17sp" />
+
+            <Switch
+                android:id="@+id/switchVibracion"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- ── Sección: Distancia de alerta ────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Distancia de alerta"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="¿A qué distancia debe alertar sobre muebles y obstáculos?"
+            android:textColor="#BBBBBB"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <RadioGroup
+            android:id="@+id/rgDistancia"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#2A2A4E"
+            android:padding="16dp"
+            android:layout_marginBottom="24dp">
+
+            <RadioButton
+                android:id="@+id/rb2m"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="2 metros — alerta anticipada (~4m real)"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rb1m"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="1 metro — distancia normal (~2m real)"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:checked="true"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rb05m"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="0.5 metros — alerta solo cuando está muy cerca"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:buttonTint="#AAAAFF" />
+        </RadioGroup>
+
+        <!-- ── Sección: Velocidad de voz ────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Velocidad de voz"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <RadioGroup
+            android:id="@+id/rgVelocidad"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#2A2A4E"
+            android:padding="16dp"
+            android:layout_marginBottom="32dp">
+
+            <RadioButton
+                android:id="@+id/rbLento"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Lento"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbNormal"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Normal"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:checked="true"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbRapido"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Rápido"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:buttonTint="#AAAAFF" />
+        </RadioGroup>
+
+        <!-- ── Sección: Perfil de tono ──────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Perfil de tono"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Cambia el tono de la voz para que suene menos robótica."
+            android:textColor="#BBBBBB"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <RadioGroup
+            android:id="@+id/rgTono"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#2A2A4E"
+            android:padding="16dp"
+            android:layout_marginBottom="24dp">
+
+            <RadioButton
+                android:id="@+id/rbNatural"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Natural — tono estándar del sistema"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:checked="true"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbCalida"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Cálida — suena más humana y menos robótica"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbGrave"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Grave — tono bajo y sereno, fácil de escuchar"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbAnimada"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Animada — tono alto y claro"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:paddingStart="8dp"
+                android:layout_marginBottom="10dp"
+                android:buttonTint="#AAAAFF" />
+
+            <RadioButton
+                android:id="@+id/rbSuave"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Suave — tono bajo y lento, tranquilizador"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:paddingStart="8dp"
+                android:buttonTint="#AAAAFF" />
+        </RadioGroup>
+
+        <!-- ── Sección: Tipo de voz ─────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Tipo de voz"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Voces disponibles en este dispositivo (español)"
+            android:textColor="#BBBBBB"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <Spinner
+            android:id="@+id/spinnerVoz"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:background="#2A2A4E"
+            android:popupBackground="#2A2A4E"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Botón para probar la voz seleccionada -->
+        <Button
+            android:id="@+id/btnProbarVoz"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Probar voz seleccionada"
+            android:textSize="15sp"
+            android:backgroundTint="#3A3A6E"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="24dp" />
+
+        <!-- ── Sección: Ayuda ────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Ayuda"
+            android:textColor="#AAAAFF"
+            android:textSize="14sp"
+            android:textAllCaps="true"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Tarjeta de ayuda con el texto -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#2A2A4E"
+            android:padding="16dp"
+            android:layout_marginBottom="16dp">
+
+            <TextView
+                android:id="@+id/tvAyuda"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#DDDDDD"
+                android:textSize="15sp"
+                android:lineSpacingMultiplier="1.5"
+                android:text="Esta aplicación usa la cámara del teléfono para detectar objetos y guiar a personas con discapacidad visual.\n\nAl iniciar, el sistema describe el entorno. Luego, mientras caminas, avisa por voz y vibración cuando hay obstáculos cerca.\n\nNiveles de alerta:\n• Aviso: objeto a más de 4 metros.\n• Cerca: objeto a unos 3 metros, desvíate.\n• Peligro: objeto a 2 metros, detente.\n• Crítico: objeto muy cerca, para de inmediato.\n\nCuando hay un grupo de muebles como sillas o mesas, el sistema lo anuncia una vez y vibra solo si sigues acercándote.\n\nSi el camino está bloqueado por todos lados, el sistema te pedirá que muevas el teléfono lentamente hacia los lados para buscar una salida.\n\nLa linterna se enciende automáticamente si hay poca luz.\n\nSi el teléfono no detecta movimiento por 12 segundos, entra en pausa para ahorrar batería. Muévete para reactivarlo." />
+
+        </LinearLayout>
+
+        <!-- Botón escuchar ayuda -->
+        <Button
+            android:id="@+id/btnEscucharAyuda"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="▶  Escuchar explicación"
+            android:textSize="16sp"
+            android:backgroundTint="#3A3A6E"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Botón detener voz (visible solo mientras habla) -->
+        <Button
+            android:id="@+id/btnDetenerAyuda"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="■  Detener"
+            android:textSize="16sp"
+            android:backgroundTint="#5E2020"
+            android:textColor="#FFFFFF"
+            android:visibility="gone"
+            android:layout_marginBottom="24dp" />
+
+        <!-- Botón cerrar -->
+        <Button
+            android:id="@+id/btnCerrar"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="Guardar y cerrar"
+            android:textSize="16sp"
+            android:backgroundTint="#AAAAFF"
+            android:textColor="#000000" />
+
+    </LinearLayout>
+</ScrollView>

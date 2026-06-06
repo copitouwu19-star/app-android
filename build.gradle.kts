@@ -2,5 +2,5 @@
 plugins {
     alias(libs.plugins.android.application) apply false
     alias(libs.plugins.kotlin.android)      apply false
-    // ELIMINADO: libs.plugins.kotlin.compose — no usamos Jetpack Compose
+    alias(libs.plugins.ksp)                 apply false
 }
