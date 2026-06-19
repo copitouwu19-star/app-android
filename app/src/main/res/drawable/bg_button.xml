@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Fondo de botón con esquinas redondeadas. El color real lo pone android:backgroundTint
+     de cada botón (el tint recolorea este shape), así cada botón conserva su color. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#FFFFFF" />
+    <corners android:radius="14dp" />
+</shape>

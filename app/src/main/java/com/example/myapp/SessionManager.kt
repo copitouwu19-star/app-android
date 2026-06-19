@@ -14,30 +14,48 @@ import kotlinx.coroutines.launch
 class SessionManager(private val context: Context, private val scope: CoroutineScope) {
 
     private val db = AppDatabase.get(context)
-    @Volatile private var sessionId: Long = 0L
+    @Volatile private var sessionId: Long = 0L        // id local (SQLite, respaldo offline)
+    @Volatile private var cloudSesionId: String = ""  // id en la nube (Supabase)
     private var locationManager: LocationManager? = null
 
     fun startSession(prefs: UserPreferences) {
+        val deviceId    = prefs.idDispositivo                       // usuario anónimo (sin login)
+        val cloudPrefId = java.util.UUID.randomUUID().toString()
+        val inicio      = System.currentTimeMillis()
+        cloudSesionId   = java.util.UUID.randomUUID().toString()
+
         scope.launch(Dispatchers.IO) {
+            // ── Local (SQLite): respaldo offline + modelo E-R para el informe ──
             val prefEntity = PreferenciaEntity(
                 distanciaAlerta    = prefs.distanciaAlerta,
                 velocidadVoz       = prefs.velocidadVoz,
                 vibracionActivada  = prefs.vibracionActivada
             )
             val prefId = db.preferenciaDao().insert(prefEntity)
-            val sesion = SesionEntity(
-                fechaHoraInicio = System.currentTimeMillis(),
-                idPreferencia   = prefId
+            sessionId  = db.sesionDao().insert(
+                SesionEntity(fechaHoraInicio = inicio, idPreferencia = prefId)
             )
-            sessionId = db.sesionDao().insert(sesion)
-            Log.d(TAG, "SESSION iniciada id=$sessionId prefId=$prefId")
+            Log.d(TAG, "SESSION local id=$sessionId prefId=$prefId")
+
+            // ── Nube (Supabase): tiempo real, visible desde la PC sin cable ──
+            SupabaseSync.upsertUsuario(deviceId)
+            SupabaseSync.insertPreferencia(
+                cloudPrefId, deviceId,
+                prefs.distanciaAlerta, prefs.velocidadVoz, prefs.vibracionActivada
+            )
+            SupabaseSync.insertSesion(cloudSesionId, deviceId, cloudPrefId, SupabaseSync.iso(inicio))
+            Log.d(TAG, "SESSION nube id=$cloudSesionId user=$deviceId")
         }
         startGps()
     }
 
     fun stopSession() {
         locationManager?.removeUpdates(locationListener)
-        Log.d(TAG, "SESSION finalizada id=$sessionId")
+        val sid = cloudSesionId
+        if (sid.isNotEmpty()) {
+            scope.launch(Dispatchers.IO) { SupabaseSync.cerrarSesion(sid, SupabaseSync.isoNow()) }
+        }
+        Log.d(TAG, "SESSION finalizada local=$sessionId nube=$sid")
     }
 
     private fun startGps() {
@@ -61,18 +79,28 @@ class SessionManager(private val context: Context, private val scope: CoroutineS
     }
 
     private val locationListener = LocationListener { location ->
-        val sid = sessionId
-        if (sid == 0L) return@LocationListener
+        val sidLocal = sessionId
+        val sidCloud = cloudSesionId
+        val ahora    = System.currentTimeMillis()
         scope.launch(Dispatchers.IO) {
-            db.ubicacionDao().insert(
-                UbicacionEntity(
-                    latitud   = location.latitude,
-                    longitud  = location.longitude,
-                    fechaHora = System.currentTimeMillis(),
-                    idSesion  = sid
+            // Local
+            if (sidLocal != 0L) {
+                db.ubicacionDao().insert(
+                    UbicacionEntity(
+                        latitud   = location.latitude,
+                        longitud  = location.longitude,
+                        fechaHora = ahora,
+                        idSesion  = sidLocal
+                    )
                 )
-            )
-            Log.d(TAG, "GPS registrado: lat=${location.latitude} lng=${location.longitude} sesion=$sid")
+            }
+            // Nube
+            if (sidCloud.isNotEmpty()) {
+                SupabaseSync.insertUbicacion(
+                    sidCloud, location.latitude, location.longitude, SupabaseSync.iso(ahora)
+                )
+            }
+            Log.d(TAG, "GPS lat=${location.latitude} lng=${location.longitude} local=$sidLocal nube=$sidCloud")
         }
     }
 }

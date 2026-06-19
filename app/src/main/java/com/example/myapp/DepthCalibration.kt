@@ -43,7 +43,13 @@ internal object DepthCalibration {
         "television"   to 0.60f, "microwave oven" to 0.35f,
         "door"         to 2.10f, "ladder"       to 1.80f,
         "lamp"         to 1.50f, "mirror"       to 1.20f,
-        "washing machine" to 0.85f, "dishwasher" to 0.85f
+        "washing machine" to 0.85f, "dishwasher" to 0.85f,
+        // Objetos sin ancla métrica previa — necesarios para estimación precisa
+        "box"              to 0.40f, "barrel"           to 0.90f,
+        "pillow"           to 0.20f, "suitcase"         to 0.65f,
+        "backpack"         to 0.50f, "houseplant"       to 0.80f,
+        "plant"            to 0.60f, "waste container"  to 0.75f,
+        "laptop"           to 0.30f, "computer monitor" to 0.45f
     )
 
     internal val TYPICAL_WIDTH_M = mapOf(
@@ -69,7 +75,13 @@ internal object DepthCalibration {
         "studio couch" to 1.90f, "infant bed"   to 0.90f,
         "television"   to 1.00f, "microwave oven" to 0.60f,
         "door"         to 1.00f, "ladder"       to 0.60f,
-        "washing machine" to 0.75f, "dishwasher" to 0.75f
+        "washing machine" to 0.75f, "dishwasher" to 0.75f,
+        // Objetos sin ancla métrica previa
+        "box"              to 0.40f, "barrel"           to 0.60f,
+        "pillow"           to 0.45f, "suitcase"         to 0.45f,
+        "backpack"         to 0.35f, "houseplant"       to 0.50f,
+        "plant"            to 0.40f, "waste container"  to 0.45f,
+        "laptop"           to 0.35f, "computer monitor" to 0.55f
     )
 
     /** Profundidad normalizada (0=lejos, 1=muy cerca) estimada por la ALTURA del bbox */
@@ -105,6 +117,26 @@ internal object DepthCalibration {
         "wardrobe","bookcase","cabinetry","stool","infant bed" -> when {
             boxW >= 0.78f || boxH >= 0.70f -> DEPTH_PELIGRO + 0.05f  // < ~1.2m, realmente muy cerca
             boxW >= 0.48f || boxH >= 0.45f -> DEPTH_CERCA             // < ~3m
+            else -> null
+        }
+        "laptop", "computer monitor", "television" -> when {
+            boxW >= 0.60f || boxH >= 0.50f -> DEPTH_PELIGRO + 0.05f
+            boxW >= 0.35f || boxH >= 0.30f -> DEPTH_CERCA
+            else -> null
+        }
+        "refrigerator", "washing machine", "dishwasher" -> when {
+            boxW >= 0.65f || boxH >= 0.60f -> DEPTH_PELIGRO + 0.05f
+            boxW >= 0.40f || boxH >= 0.40f -> DEPTH_CERCA
+            else -> null
+        }
+        // Objetos medianos en el suelo — umbrales más sensibles porque son más pequeños
+        "box", "barrel", "suitcase", "backpack" -> when {
+            boxW >= 0.50f || boxH >= 0.45f -> DEPTH_PELIGRO + 0.05f
+            boxW >= 0.28f || boxH >= 0.25f -> DEPTH_CERCA
+            else -> null
+        }
+        "pillow" -> when {
+            boxW >= 0.35f || boxH >= 0.25f -> DEPTH_CERCA
             else -> null
         }
         "person" -> when {

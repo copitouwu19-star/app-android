@@ -58,13 +58,30 @@
         android:layout_marginTop="16dp"
         android:layout_marginEnd="16dp" />
 
+    <!-- Indicador de quién está hablando: detección rápida (YOLO) o IA (Gemini) -->
+    <TextView
+        android:id="@+id/sourceIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="⚡ Detección rápida"
+        android:textColor="#00BFFF"
+        android:textSize="12sp"
+        android:textStyle="bold"
+        android:background="#AA000000"
+        android:padding="6dp"
+        android:visibility="invisible"
+        app:layout_constraintTop_toBottomOf="@id/modeIndicator"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp" />
+
     <!-- Botón de configuración — esquina superior izquierda -->
     <ImageButton
         android:id="@+id/settingsBtn"
         android:layout_width="48dp"
         android:layout_height="48dp"
         android:src="@drawable/ic_settings"
-        android:background="#AA000000"
+        android:background="@android:color/transparent"
         android:padding="10dp"
         android:contentDescription="Configuración"
         app:layout_constraintTop_toTopOf="parent"

@@ -10,13 +10,18 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.*
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.AttributeSet
 import android.util.Log
+import android.view.KeyEvent
 import android.view.View
 import android.widget.ImageButton
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.camera.core.*
 import androidx.camera.core.Camera
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -44,7 +49,7 @@ internal const val MODELO_YOLO  = "yolov8n-oiv7_float32.tflite"
 internal const val MODELO_DEPTH = "midas_v21_small_256.tflite"
 
 internal const val YOLO_INPUT_SIZE = 320
-internal const val SCORE_MINIMO    = 0.28f  // umbral bajo para capturar muebles en interiores con poca luz
+internal const val SCORE_MINIMO    = 0.22f  // umbral bajo para capturar muebles en interiores con poca luz
 internal const val NMS_IOU_THRESH  = 0.45f
 internal const val MAX_DETECCIONES = 15     // más detecciones para contexto completo
 
@@ -70,13 +75,14 @@ internal const val MIN_FRAMES_CONFIRMACION = 1
 // Flash
 internal const val DARK_THRESHOLD   = 55
 internal const val TORCH_OFF_THRESH = 150
+internal const val LUX_OFF_THRESH   = 60f   // lux del sensor ambiental → apagar linterna (hay luz suficiente)
 internal const val TORCH_DEBOUNCE   = 5_000L
 internal const val BRIGHT_SAMPLES   = 8
 
 // Cooldowns TTS
 internal const val COOLDOWN_CRITICO    = 1_500L  // peligro máximo: 1.5s
 internal const val COOLDOWN_PELIGRO    = 2_000L  // reducido a 2s para respuesta más rápida
-internal const val COOLDOWN_NAVEGACION = 2_500L  // reducido a 2.5s para instrucciones de ruta más frecuentes
+internal const val COOLDOWN_NAVEGACION = 1_000L  // 1s entre instrucciones de navegación
 internal const val COOLDOWN_QUIETO     = 25_000L
 internal const val COOLDOWN_POST_SPEAK = 5_000L
 internal const val COOLDOWN_ESCENA     = 40_000L
@@ -192,7 +198,10 @@ internal val CROSSING_HINTS = setOf("traffic light","stop sign","car","truck","b
 // Objetos peligrosos a cualquier distancia (avisar aunque estén lejos)
 internal val HIGH_PRIORITY_OBJS = setOf(
     "car","truck","bus","motorcycle","bicycle","person","man","woman","boy","girl",
-    "dog","cat","stairs","door","ladder","van","taxi","ambulance","train","boat"
+    "dog","cat","stairs","door","ladder","van","taxi","ambulance","train","boat",
+    // Objetos de interior grandes que representan obstáculos reales
+    "laptop","computer monitor","desk","sink","toilet","refrigerator",
+    "washing machine","chest of drawers","wardrobe","bookcase","couch","bed"
 )
 
 // Objetos que NUNCA deben generar instrucciones de evasión o peligro.
@@ -207,6 +216,22 @@ internal val SAFE_OBJECTS = setOf(
     "human eye","human ear","human nose","human mouth","human head","human foot"
 )
 
+// Objetos estructurales / de fondo: arquitectura y vegetación. NUNCA son obstáculos
+// a esquivar — son el escenario, no algo con lo que se choca. Se descartan en la
+// detección para que no generen cajas, voz ni ruido de tracking. (Causa raíz del
+// falso "Detente, casa enfrente": una fachada llenaba el frame y el piso de área
+// la marcaba como peligro cercano.)
+internal val STRUCTURAL_OBJECTS = setOf(
+    "house","building","office building","skyscraper","tower","porch",
+    "window","window blind","curtain","fence","gate","wall",
+    "tree","palm tree","tree house","billboard","street light"
+)
+
+// Puntos de referencia: se ANUNCIAN por nombre y ubicación para que el usuario sepa
+// que están ahí (y no choque), pero SIN instrucción de evasión ni "detente" — porque
+// el usuario puede querer atravesarlos (ej. una puerta).
+internal val LANDMARK_OBJECTS = setOf("door")
+
 internal data class LabelEs(val art: String, val noun: String, val short: String)
 internal val LABEL_ES = mapOf(
     // Personas
@@ -219,15 +244,19 @@ internal val LABEL_ES = mapOf(
     "bicycle"        to LabelEs("una","bicicleta","bici"),
     "car"            to LabelEs("un","automóvil","auto"),
     "motorcycle"     to LabelEs("una","motocicleta","moto"),
-    "airplane"       to LabelEs("un","avión","avión"),
-    "aircraft"       to LabelEs("un","avión","avión"),
+    // train/airplane/boat: en navegación peatonal son SIEMPRE errores de etiqueta de YOLO
+    // (Sofia: un arco de ladrillo / una máquina blanca con ruedas → "tren a la izquierda").
+    // Se remapean a "objeto" genérico: la detección y la instrucción siguen igual (seguras),
+    // pero ya no dice un nombre absurdo que confunde y queda mal en la demo.
+    "airplane"       to LabelEs("un","objeto","objeto"),
+    "aircraft"       to LabelEs("un","objeto","objeto"),
     "bus"            to LabelEs("un","autobús","autobús"),
-    "train"          to LabelEs("un","tren","tren"),
+    "train"          to LabelEs("un","objeto","objeto"),
     "truck"          to LabelEs("un","camión","camión"),
     "van"            to LabelEs("una","camioneta","camioneta"),
     "taxi"           to LabelEs("un","taxi","taxi"),
     "ambulance"      to LabelEs("una","ambulancia","ambulancia"),
-    "boat"           to LabelEs("un","bote","bote"),
+    "boat"           to LabelEs("un","objeto","objeto"),
     // Señales
     "traffic light"  to LabelEs("un","semáforo","semáforo"),
     "traffic sign"   to LabelEs("una","señal","señal"),
@@ -615,6 +644,7 @@ class YoloDetector(modelPath: String, context: Context) {
         }
         return raws.indices.filter { kept[it] }.take(MAX_DETECCIONES)
             .map { Detection(raws[it].box, OIV7_LABELS.getOrElse(raws[it].cls) { "objeto" }, raws[it].score) }
+            .filter { it.label !in STRUCTURAL_OBJECTS }   // arquitectura/fondo: no son obstáculos
     }
 
     private fun iou(a: RectF, b: RectF): Float {
@@ -772,25 +802,48 @@ class TrackManager {
         var sum = 0f; var count = 0
         for (y in y0..y1 step 2) for (x in x0..x1 step 2) { sum += map[y][x]; count++ }
         val midasRaw = if (count > 0) sum / count else 0f
-        // Usar ancla métrica combinada (altura + ancho + techo de píxeles).
-        // Si MiDaS infla valores en interiores, la métrica lo corrige.
         val metricAnchor = bestMetricAnchor(box, label)
-        return if (metricAnchor != null) {
-            // 40% métrica (tamaño del box) + 60% MiDaS (profundidad real)
-            // Más peso a MiDaS para no inflar distancias cuando YOLO dibuja boxes grandes
-            (metricAnchor * 0.40f + midasRaw * 0.60f).coerceIn(0f, 1f)
+
+        // Piso por área: si el objeto ocupa mucho del frame está físicamente muy cerca,
+        // sin importar lo que diga MiDaS (que subestima cuando el objeto llena el frame).
+        val area = box.width() * box.height()
+        var areaFloor = when {
+            area > 0.50f -> DEPTH_CRITICO   // >50% del frame → colisión inminente
+            area > 0.30f -> DEPTH_PELIGRO   // >30% del frame → muy cerca
+            area > 0.15f -> DEPTH_CERCA     // >15% del frame → cerca
+            else         -> 0f
+        }
+        // Si el objeto no tiene tamaño real conocido (sin ancla métrica) y MiDaS NO
+        // confirma cercanía, el área sola NO puede declararlo crítico: un objeto grande
+        // pero lejano (pared/mueble de fondo) no debe gritar "detente". Lo capamos a CERCA.
+        if (metricAnchor == null && midasRaw < DEPTH_CERCA) {
+            areaFloor = minOf(areaFloor, DEPTH_CERCA)
+        }
+
+        val blended = if (metricAnchor != null) {
+            // El ancla métrica es ABSOLUTA (mide el tamaño real del objeto); MiDaS es
+            // RELATIVA e infla al objeto más cercano en interiores (una silla a 3m la
+            // lee "muy cerca" porque es lo más próximo del cuarto → falso "detente").
+            // Por eso ahora manda el ancla (0.65) y MiDaS solo ajusta (0.35).
+            (metricAnchor * 0.65f + midasRaw * 0.35f).coerceIn(0f, 1f)
         } else {
-            // Sin referencia métrica: MiDaS con techo conservador basado en área
             val areaCap = (box.width() * box.height() * 1.5f + 0.15f).coerceAtMost(0.45f)
             minOf(midasRaw, areaCap + 0.20f).coerceIn(0f, 1f)
         }
+        return maxOf(blended, areaFloor).coerceIn(0f, 1f)
     }
 
     private fun fallback(box: RectF, label: String = ""): Float {
         val metricDepth = bestMetricAnchor(box, label)
-        if (metricDepth != null) return metricDepth.coerceIn(0f, 1f)
-        val area = (box.width() * box.height()).coerceIn(0f, 1f)
-        return (area * 2.5f + 0.10f).coerceAtMost(0.90f)
+        val area = box.width() * box.height()
+        val areaFloor = when {
+            area > 0.50f -> DEPTH_CRITICO
+            area > 0.30f -> DEPTH_PELIGRO
+            area > 0.15f -> DEPTH_CERCA
+            else         -> 0f
+        }
+        if (metricDepth != null) return maxOf(metricDepth, areaFloor).coerceIn(0f, 1f)
+        return maxOf((area * 2.5f + 0.10f).coerceAtMost(0.90f), areaFloor).coerceIn(0f, 1f)
     }
 
     fun allTracks(): List<ObjectTrack> = tracks.filter { it.framesLost == 0 }
@@ -811,11 +864,41 @@ enum class EventPriority(val level: Int) {
     CRITICO(5), PELIGRO_INMEDIATO(4), NAVEGACION_URGENTE(3), NAVEGACION_NORMAL(2), CONTEXTO(1), QUIETO(0)
 }
 
-data class NavEvent(val message: String, val priority: EventPriority, val ts: Long = System.currentTimeMillis()) : Comparable<NavEvent> {
+/** Origen del mensaje hablado — para mostrar al usuario quién está "decidiendo" en cada momento. */
+enum class SpeechSource { YOLO, GEMINI }
+
+/**
+ * Candidato de peligro para el ÁRBITRO ÚNICO. Antes cada detector (objeto YOLO,
+ * escalón, suelo, pared) llamaba a speak()/vibrate() por su cuenta cada frame y se
+ * cortaban la frase entre sí (QUEUE_FLUSH) apilando vibraciones. Ahora todos aportan
+ * un HazardCandidate y se habla SOLO el más urgente: una voz, una vibración por evento.
+ */
+private data class HazardCandidate(
+    val message: String,
+    val priority: EventPriority,
+    val vibrateMs: Long = 0L,
+    val interrupt: Boolean = false,
+    // Banda de cercanía 0-4 del peligro. El árbitro repite un aviso idéntico solo si
+    // este nivel SUBE (te estás acercando = a punto de chocar). Si no sube, no insiste
+    // (estar parada frente a algo no necesita metralleta). Resuelve a la vez la latencia
+    // ("avisa tarde y choco") y el spam, sin volver a la metralleta de los timers fijos.
+    val level: Int = 0,
+    // El DecisionEngine (YOLO) ya gestiona sus propias repeticiones → el árbitro no le
+    // aplica el freno de frase idéntica.
+    val selfManaged: Boolean = false
+)
+
+data class NavEvent(
+    val message: String,
+    val priority: EventPriority,
+    val ts: Long = System.currentTimeMillis(),
+    val interruptSpeech: Boolean = false,
+    val source: SpeechSource = SpeechSource.YOLO
+) : Comparable<NavEvent> {
     override fun compareTo(other: NavEvent): Int = compareValuesBy(other, this, { it.priority.level }, { it.ts })
 }
 
-class TtsPriorityQueue(private val tts: TextToSpeech) {
+class TtsPriorityQueue(private val tts: TextToSpeech, private val onSpeak: ((SpeechSource) -> Unit)? = null) {
     private val queue = PriorityQueue<NavEvent>()
     private var lastTime = 0L; private var lastPriority = EventPriority.QUIETO
     var userSpeedMultiplier = 1.0f
@@ -833,23 +916,35 @@ class TtsPriorityQueue(private val tts: TextToSpeech) {
     @Synchronized fun enqueue(event: NavEvent) {
         val now = System.currentTimeMillis()
         val cd  = cooldowns[event.priority] ?: 5_000L
-        if (event.priority.level <= lastPriority.level && now - lastTime < cd) return
+        // interruptSpeech=true → situación nueva, no respetar cooldown
+        if (!event.interruptSpeech && event.priority.level <= lastPriority.level && now - lastTime < cd) return
         queue.removeIf { it.priority.level < event.priority.level }
         queue.offer(event); flush()
     }
 
     @Synchronized fun flush() {
-        // Descartar mensajes viejos de baja prioridad (evita instrucciones de una escena anterior).
+        // Descartar mensajes viejos de escenas anteriores.
+        // interruptSpeech=true nunca se descarta — es situación nueva con prioridad real.
         while (true) {
             val ev = queue.peek() ?: return
-            if (ev.priority.level < EventPriority.PELIGRO_INMEDIATO.level) {
-                val staleMs = if (ev.priority == EventPriority.NAVEGACION_URGENTE) 3_000L else 2_500L
+            if (!ev.interruptSpeech && ev.priority.level < EventPriority.PELIGRO_INMEDIATO.level) {
+                val staleMs = if (ev.priority == EventPriority.NAVEGACION_URGENTE) 1_200L else 800L
                 if (System.currentTimeMillis() - ev.ts > staleMs) { queue.poll(); continue }
             }
             break
         }
         val event = queue.peek() ?: return
-        val interrupt = event.priority.level >= EventPriority.PELIGRO_INMEDIATO.level
+        // ¿Interrumpir el habla en curso? Antes CUALQUIER aviso de peligro cortaba la frase
+        // anterior a media palabra ("algo al frente, ava..." → "camino obstruido detente"),
+        // porque la profundidad oscila de banda y salían las dos versiones del MISMO obstáculo
+        // (reporte de Sofia). Ahora: un aviso que YA está sonando TERMINA su frase; el siguiente
+        // espera su turno (uno tras otro). Solo cortan: (a) un salto a CRÍTICO/interruptSpeech
+        // real —estás por chocar, debe cortar— o (b) si lo que suena es solo cháchara de
+        // ambiente (CONTEXTO/QUIETO), que sí puede cederle el paso a un peligro.
+        val sonandoEsChachara = lastPriority.level <= EventPriority.CONTEXTO.level
+        val interrupt = event.interruptSpeech ||
+            event.priority == EventPriority.CRITICO ||
+            (sonandoEsChachara && event.priority.level >= EventPriority.PELIGRO_INMEDIATO.level)
         if (tts.isSpeaking && !interrupt) return
         queue.poll()
         val baseSpeed = when (event.priority) {
@@ -858,13 +953,18 @@ class TtsPriorityQueue(private val tts: TextToSpeech) {
             EventPriority.NAVEGACION_URGENTE -> 1.0f
             else -> 0.98f
         }
-        if (event.priority == EventPriority.CRITICO && tts.isSpeaking) tts.stop()
+        if ((event.priority == EventPriority.CRITICO || event.interruptSpeech) && tts.isSpeaking) tts.stop()
+        onSpeak?.invoke(event.source)
         tts.setPitch(userPitch)
         tts.setSpeechRate(baseSpeed * userSpeedMultiplier)
         tts.speak(event.message, TextToSpeech.QUEUE_FLUSH, null,
             "nav_${event.priority.name}_${System.currentTimeMillis()}")
         lastTime = System.currentTimeMillis(); lastPriority = event.priority
     }
+
+    /** Vacía la cola de mensajes pendientes (al invocar el asistente de voz: no queremos que
+     *  alertas de navegación encoladas suenen encima de la configuración). */
+    @Synchronized fun clear() { queue.clear() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -875,11 +975,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: DetectionOverlay
     private lateinit var scanModeLabel: TextView
+    private lateinit var sourceIndicator: TextView
     private lateinit var settingsBtn: ImageButton
     private lateinit var tts: TextToSpeech
     @Volatile private var ttsReady = false
     private lateinit var ttsQueue: TtsPriorityQueue
     private lateinit var sessionManager: SessionManager
+
+    // Asistente de voz para ajustes — pulsación larga en pantalla, o respaldo físico:
+    // mantener presionados AMBOS botones de volumen a la vez (fácil de ubicar al tacto)
+    private var speechRecognizer: SpeechRecognizer? = null
+    @Volatile private var listeningForCommand = false
+    private var volUpPressed   = false
+    private var volDownPressed = false
+    private var volChordFired  = false
 
     private var camera: Camera? = null
     private lateinit var vibrator: Vibrator
@@ -897,6 +1006,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var sensorMgr: SensorManager
     private var accel:  Sensor? = null
     private var gyro:   Sensor? = null
+    private var lightSensor: Sensor? = null
+    // Luz ambiental real (lux), independiente de la propia linterna. -1 = sin lectura aún / sin sensor.
+    @Volatile private var ambientLux: Float = -1f
     @Volatile private var lastMotionTime = System.currentTimeMillis()
 
     // Estado de escaneo con giroscopio
@@ -910,14 +1022,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var postScanCheckPending = false
 
     // Timestamps
-    private var lastSpeakTime       = 0L
-    private var lastStillTime       = 0L
-    private var lastSceneTime       = 0L
-    private var lastCrossTime       = 0L
-    private var lastWallTime        = 0L
-    private var lastStairsTime      = 0L
-    private var lastObstacleTime    = 0L
-    private var lastStreetGuideTime = 0L
+    private var lastSpeakTime        = 0L
+    private var lastSpokenMsg         = ""   // última frase hablada (para no repetir idéntico en pocos segundos)
+    private var lastSpokenLevel       = 0    // nivel de cercanía del último aviso (para detectar escalada)
+    // Reloj DEDICADO a los avisos de profundidad (pared/suelo/objeto), separado del global.
+    // El global se "ensucia" con la voz de YOLO y hacía que "camino obstruido" llegara tarde.
+    private var lastDepthSpeakTime    = 0L
+    private var lastDepthLevel        = 0
+    private var prevFrente            = -1f   // cercanía del frente suavizada (para saber si te ACERCÁS)
+    private var lastStillTime        = 0L
+    private var lastSceneTime        = 0L
+    private var lastCrossTime        = 0L
+    private var lastWallTime         = 0L
+    private var lastStairsTime       = 0L
+    private var lastObstacleTime     = 0L
+    private var lastGroundHazardTime = 0L
+    private var lastStreetGuideTime  = 0L
 
     // Tracking de tipo de escena para detectar cambios de entorno
     private var lastSceneType: SceneType = SceneType.DESCONOCIDO
@@ -962,13 +1082,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // ── Ciclo de vida ─────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Aplicar el tema claro/oscuro guardado (elegido en Configuración, para la demostración).
+        AppCompatDelegate.setDefaultNightMode(
+            if (UserPreferences(this).temaOscuro) AppCompatDelegate.MODE_NIGHT_YES
+            else AppCompatDelegate.MODE_NIGHT_NO
+        )
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         previewView   = findViewById(R.id.viewFinder)
         overlay       = findViewById(R.id.detectionOverlay)
-        scanModeLabel = findViewById(R.id.scanModeLabel)
-        settingsBtn   = findViewById(R.id.settingsBtn)
+        scanModeLabel  = findViewById(R.id.scanModeLabel)
+        sourceIndicator = findViewById(R.id.sourceIndicator)
+        settingsBtn    = findViewById(R.id.settingsBtn)
 
         userPrefs = UserPreferences(this)
         sessionManager = SessionManager(this, lifecycleScope)
@@ -983,9 +1109,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         sensorMgr = getSystemService(SENSOR_SERVICE) as SensorManager
         accel = sensorMgr.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyro  = sensorMgr.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        lightSensor = sensorMgr.getDefaultSensor(Sensor.TYPE_LIGHT)
 
         settingsBtn.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        // Activación del asistente de voz: mantener presionado en CUALQUIER parte de la
+        // pantalla (no un botón específico) — la persona usuaria es ciega y no puede
+        // ubicar visualmente un ícono pequeño. Toda la pantalla es el "botón".
+        overlay.isClickable = true
+        overlay.setOnLongClickListener {
+            startVoiceCommand()
+            true
         }
 
         initModels()
@@ -1010,6 +1145,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onResume()
         accel?.let { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
         gyro?.let  { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        lightSensor?.let { sensorMgr.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
         // Aplicar cambios de preferencias que el usuario pudo haber cambiado en Settings
         if (::ttsQueue.isInitialized) {
             ttsQueue.userSpeedMultiplier = userPrefs.getSpeechRate()
@@ -1028,6 +1164,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val mag = sqrt(event.values[0].pow(2) + event.values[1].pow(2) + event.values[2].pow(2))
                 if (abs(mag - SensorManager.GRAVITY_EARTH) > 0.8f)
                     lastMotionTime = System.currentTimeMillis()
+            }
+            Sensor.TYPE_LIGHT -> {
+                ambientLux = event.values[0]
             }
             Sensor.TYPE_GYROSCOPE -> {
                 // Acumular rotación en Z (yaw = girar el teléfono horizontalmente)
@@ -1101,7 +1240,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)
                     tts.setLanguage(java.util.Locale("es"))
                 ttsReady = true
-                ttsQueue = TtsPriorityQueue(tts).also {
+                ttsQueue = TtsPriorityQueue(tts, onSpeak = ::showSpeechSource).also {
                     it.userSpeedMultiplier = userPrefs.getSpeechRate()
                     it.userPitch           = userPrefs.getPitch()
                 }
@@ -1109,8 +1248,51 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 speak("Iniciando sistema. Analizando entorno...", EventPriority.CONTEXTO)
                 // Iniciar sesión en DB una vez que el sistema está listo
                 sessionManager.startSession(userPrefs)
+                verificarProfundidadHardware()
             } else Log.e(TAG, "TTS falló: $status")
         }
+    }
+
+    /**
+     * Diagnóstico: ¿el teléfono tiene profundidad por HARDWARE (ToF/LiDAR) o solo
+     * estimación por IA (MiDaS)? Consulta a Camera2 la capacidad DEPTH_OUTPUT y reporta
+     * por log, Toast en pantalla y voz. Distingue la cámara trasera (útil para navegación)
+     * de la frontal (face unlock, no usable). Sirve para documentar el hardware en el informe.
+     */
+    private fun verificarProfundidadHardware() {
+        val resultado = try {
+            val cm = getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+            val conDepth = mutableListOf<String>()
+            for (id in cm.cameraIdList) {
+                val chars = cm.getCameraCharacteristics(id)
+                val caps = chars.get(android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                val tieneDepth = caps?.contains(
+                    android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT
+                ) == true
+                if (tieneDepth) {
+                    val cara = when (chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)) {
+                        android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK  -> "trasera"
+                        android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT -> "frontal"
+                        else -> "otra"
+                    }
+                    conDepth += "cam $id ($cara)"
+                }
+            }
+            when {
+                conDepth.isEmpty() ->
+                    "Profundidad por hardware no disponible. Se usa estimación por inteligencia artificial."
+                conDepth.any { it.contains("trasera") } ->
+                    "Profundidad por hardware disponible en la cámara trasera. ${conDepth.joinToString()}"
+                else ->
+                    "Profundidad por hardware solo en la cámara frontal, no usable para navegación. Se usa inteligencia artificial."
+            }
+        } catch (e: Exception) {
+            "No se pudo verificar la profundidad por hardware: ${e.message}"
+        }
+        // Solo queda en el log (ya verificamos que el Redmi no tiene ToF → usa MiDaS). Se
+        // quitaron el cartel en pantalla (Toast) y la voz de inicio: eran ruido para la demo
+        // y ya cumplieron su función de diagnóstico (pedido de Sofia, 16 Jun).
+        Log.i(TAG, "DEPTH_HW => $resultado")
     }
 
     /** Selecciona la voz española de mayor calidad disponible en el dispositivo.
@@ -1244,17 +1426,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val areas = tracks.map { it.box.width() * it.box.height() }
         checkSceneChange(inferScene(labels, areas), tracks, labels, now)
 
-        // ── DECISION ENGINE — única fuente de verdad para hablar ─────────────
-        // Selecciona 1 objeto principal, construye mensaje con pasos + evasión,
-        // filtra repeticiones y repite solo si el usuario no reaccionó.
+        // ── DECISION ENGINE — objeto YOLO principal ──────────────────────────
         val speakDecision = decisionEngine.process(tracks, lastMotionTime, now, userPrefs.getDepthThreshold())
-
-        if (speakDecision != null) {
-            speak(speakDecision.message, speakDecision.priority)
-            if (speakDecision.vibrateMs > 0) vibrate(speakDecision.vibrateMs)
-            if (speakDecision.requestScan) startScanMode()
-            lastSpeakTime = now
-        }
 
         // ── POST-SCAN: si el escaneo terminó y seguimos bloqueados → Gemini ─────
         if (postScanCheckPending && !geminiRunning) {
@@ -1264,41 +1437,158 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
 
-        // ── ESCALONES (peligro de caída) ──────────────────────────────────────
-        // Se evalúa SIEMPRE y con prioridad alta para que pueda interrumpir.
-        // Antes estaba bloqueado tras speakDecision==null y !tts.isSpeaking, por
-        // eso el aviso llegaba ~10s tarde (cuando ya habías pasado el escalón).
+        // ── ÁRBITRO ÚNICO DE PELIGROS ─────────────────────────────────────────
+        // Los 4 detectores aportan candidatos; se habla SOLO el más urgente, con
+        // UNA voz y UNA vibración. Antes cada uno llamaba a speak()/vibrate() por
+        // su cuenta y se cortaban la frase entre sí (efecto "detente detente" sin
+        // terminar) apilando vibraciones. Esta es la causa raíz de la repetición.
+        val hazards = mutableListOf<HazardCandidate>()
+
+        // 1) Objeto reconocido por YOLO (silla, persona, mesa, puerta…)
+        speakDecision?.let {
+            val lvl = when (it.priority) {
+                EventPriority.CRITICO            -> 4
+                EventPriority.PELIGRO_INMEDIATO  -> 3
+                EventPriority.NAVEGACION_URGENTE -> 2
+                else                             -> 1
+            }
+            hazards += HazardCandidate(it.message, it.priority, it.vibrateMs, it.interruptSpeech,
+                level = lvl, selfManaged = true)
+        }
+
+        // 2) Escalón (peligro de caída)
         if (now - lastStairsTime > 6_000L && detectEscalonesAdelante(depthMap)) {
-            speak("¡Cuidado! Posible escalón adelante.", EventPriority.PELIGRO_INMEDIATO)
-            vibrate(400L)
+            hazards += HazardCandidate("¡Cuidado! Posible escalón adelante.", EventPriority.PELIGRO_INMEDIATO, 400L)
             lastStairsTime = now
         }
 
-        // ── OBSTÁCULO/PARED SIN ETIQUETA YOLO ────────────────────────────────
-        // Cubre gavetero, mesita, pared, esquina — cualquier bloqueo que YOLO
-        // no reconoció. Se evalúa siempre que el centro no tenga track YOLO.
-        // Excluir SAFE_OBJECTS: frutas/comida en el centro no deben bloquear la detección sin etiqueta.
+        // 3) Obstáculo en el suelo — solo si el centro NO está cubierto por un objeto
+        //    YOLO. Antes solo miraba cy>0.55, por eso disparaba falso "obstáculo en el
+        //    suelo" junto a una mesa/silla (su parte baja en el frame). Ahora si hay
+        //    cualquier objeto reconocido cerca en el centro, este detector se calla.
         val centerCoveredByYolo = tracks.any { it.zone == "centro" && it.depthScore >= DEPTH_CERCA && it.label !in SAFE_OBJECTS }
-        if (!centerCoveredByYolo && now - lastObstacleTime > 2_800L) {
-            val isPared  = detectParedAlFrente(depthMap)
+        val groundCoveredByYolo = centerCoveredByYolo || tracks.any {
+            it.cy > 0.55f && it.depthScore >= DEPTH_CERCA && it.label !in SAFE_OBJECTS
+        }
+        // ¿Es una BARRERA VERTICAL (pared/mueble alto) y no un bulto en el piso? Se decide
+        // mirando si la cercanía SUBE por el cuadro: bulto en el piso = cerca solo abajo,
+        // despejado arriba; pared = cerca de abajo hacia el medio. Si es barrera, el detector
+        // de suelo se calla y se reporta "Camino obstruido" (pedido de Sofia: la pared decía
+        // mal "obstáculo en el suelo").
+        val barrera = detectBarreraVertical(depthMap)
+        if (!groundCoveredByYolo && !barrera && now - lastGroundHazardTime > 2_000L) {
+            val groundDepth = detectObstaculoEnSuelo(depthMap)
+            // Mensaje genérico ("objeto en el camino"): aunque YOLO no sepa qué es (mesita
+            // baja, banco, caja), lo importante es que NO choque — pedido de Sofia.
+            // "Detente" (ORDEN) reservado a peligro INMINENTE (crítico); con margen → solo info.
+            if (groundDepth >= DEPTH_CRITICO) {
+                hazards += HazardCandidate("¡Detente! Objeto muy cerca.", EventPriority.CRITICO, 500L, interrupt = true, level = 4)
+                lastGroundHazardTime = now
+            } else if (groundDepth >= DEPTH_PELIGRO) {
+                hazards += HazardCandidate("Objeto en el camino.", EventPriority.PELIGRO_INMEDIATO, 350L, level = 3)
+                lastGroundHazardTime = now
+            } else if (groundDepth >= DEPTH_CERCA) {
+                hazards += HazardCandidate("Algo en el camino. Pisa con cuidado.", EventPriority.NAVEGACION_URGENTE, 200L, level = 2)
+                lastGroundHazardTime = now
+            }
+        }
+
+        // Cercanía del frente y si te estás ACERCANDO (el frente sube respecto al promedio
+        // suavizado). Sirve para graduar la pared lisa Y para que el gate re-avise rápido un
+        // obstáculo NUEVO mientras caminás hacia él, aunque acabe de hablar de otro (lo que
+        // causaba que la pared "llegara tarde" en un recorrido con muchos obstáculos seguidos).
+        val frente = frenteCercania(depthMap)
+        val frenteSubiendo = prevFrente >= 0f && (frente - prevFrente) > 0.015f
+        prevFrente = if (prevFrente < 0f) frente else prevFrente * 0.7f + frente * 0.3f
+
+        // 4) Pared / barrera / objeto bajo sin etiqueta YOLO (gavetero, mesita, pared, esquina)
+        if (!centerCoveredByYolo && now - lastObstacleTime > 2_000L) {
+            // Pared lisa/columna cercana: solo si el PISO se corta cerca Y te estás ACERCANDO.
+            // La doble condición evita el falso positivo de una pared al fondo del cuarto (no te
+            // acercás / el piso se aleja) y a la vez la detecta a tiempo cuando caminás hacia ella.
+            val bloqueoCercano = detectBloqueoCercano(depthMap) && frenteSubiendo
+            val isPared  = detectParedAlFrente(depthMap) || barrera || bloqueoCercano
             val obsDepth = if (!isPared) detectObstaculoCercanoSinYolo(depthMap) else 0f
             when {
-                isPared && now - lastWallTime > 7_000L -> {
-                    speak("Camino obstruido. Detente.", EventPriority.PELIGRO_INMEDIATO)
-                    vibrate(350L); lastWallTime = now; lastObstacleTime = now
-                }
-                obsDepth >= DEPTH_PELIGRO -> {
-                    val prio = if (obsDepth >= DEPTH_CRITICO) EventPriority.PELIGRO_INMEDIATO
-                               else EventPriority.NAVEGACION_URGENTE
-                    speak("Objeto al frente.", prio)
-                    vibrate(if (prio == EventPriority.PELIGRO_INMEDIATO) 400L else 200L)
-                    lastObstacleTime = now
+                isPared -> {
+                    // Escalada: si el frente ya está CRÍTICO (a punto de chocar) → aviso fuerte
+                    // inmediato que interrumpe; si solo está bloqueado → "camino obstruido".
+                    // Cooldown corto (3s, antes 7s) para que re-avise mientras te seguís acercando.
+                    val critico = frente >= DEPTH_CRITICO
+                    val wallCd  = if (critico) 1_200L else 3_000L
+                    if (now - lastWallTime > wallCd) {
+                        // "¡Detente!" (ORDEN) solo si es inminente; con margen → info calmada.
+                        if (critico)
+                            hazards += HazardCandidate("¡Detente! Camino bloqueado.", EventPriority.CRITICO, 500L, interrupt = true, level = 4)
+                        else
+                            hazards += HazardCandidate("Camino obstruido.", EventPriority.PELIGRO_INMEDIATO, 350L, level = 3)
+                        lastWallTime = now; lastObstacleTime = now
+                    }
                 }
                 obsDepth >= DEPTH_CERCA -> {
-                    speak("Algo al frente. Avanza con cuidado.", EventPriority.NAVEGACION_NORMAL)
+                    val band = when {
+                        obsDepth >= DEPTH_CRITICO -> 4
+                        obsDepth >= DEPTH_PELIGRO -> 3
+                        else                      -> 2
+                    }
+                    val prio = when {
+                        obsDepth >= DEPTH_CRITICO -> EventPriority.CRITICO
+                        obsDepth >= DEPTH_PELIGRO -> EventPriority.PELIGRO_INMEDIATO
+                        else                      -> EventPriority.NAVEGACION_NORMAL
+                    }
+                    // "¡Detente!" (ORDEN) solo inminente (band 4); con margen → info calmada.
+                    val msg = when {
+                        band >= 4 -> "¡Detente! Objeto muy cerca."
+                        band >= 3 -> "Objeto al frente."
+                        else      -> "Algo al frente. Avanza con cuidado."
+                    }
+                    hazards += HazardCandidate(msg, prio, if (band >= 3) 400L else 0L, interrupt = band >= 4, level = band)
                     lastObstacleTime = now
                 }
             }
+        }
+
+        // Se habla UNO solo: el de mayor prioridad. A igualdad gana el primero
+        // (DecisionEngine), que es el más específico ("silla" vs. "objeto al frente").
+        hazards.maxByOrNull { it.priority.level }?.let { winner ->
+            // UNA sola frase por obstáculo (decisión de mentor con Sofia): para un usuario ciego
+            // el oído es su sentido de navegación; dos avisos parecidos del mismo bloqueo lo
+            // agotan, le tapan el entorno y erosionan la confianza. La profundidad oscila de
+            // banda y antes salían "algo al frente" + "detente" pegados. Regla para avisos de
+            // profundidad (no-YOLO):
+            //   • CRÍTICO (peligro inminente, a punto de chocar) → habla YA, siempre.
+            //   • Escalada normal (aviso suave → "detente") → solo si pasaron ≥2s del aviso
+            //     previo, así NO se apila "detente" sobre "algo al frente"; si seguís acercándote
+            //     suena como progresión espaciada, no como eco.
+            //   • Mismo nivel o menor (parada / oscilación de cámara) → recordatorio suave c/8s.
+            // El DecisionEngine (selfManaged, objetos YOLO con nombre) gestiona lo suyo aparte.
+            // CLAVE: el gate usa lastDepthSpeakTime/Level (reloj DEDICADO a profundidad), NO el
+            // global lastSpeakTime — que se ensuciaba con la voz de YOLO y hacía que un aviso de
+            // pared NUEVO se leyera como "mismo nivel que lo anterior" y se callara hasta 8s
+            // (la pared "llegaba 10s tarde / no avisaba"). Con reloj propio, un bloqueo nuevo
+            // (sin aviso de profundidad reciente) escala desde 0 → suena AL INSTANTE.
+            if (!winner.selfManaged) {
+                val gap    = now - lastDepthSpeakTime
+                val escala = winner.level > lastDepthLevel
+                when {
+                    // "¡Detente!" (CRÍTICO) suena al instante SOLO cuando ESCALA a inminente (recién
+                    // entrás en peligro de chocar). Si ya estás en crítico y quieta, NO se martilla
+                    // "detente detente" — cae al recordatorio calmado de abajo (pedido de Sofia).
+                    escala && winner.priority == EventPriority.CRITICO -> {}
+                    escala         -> if (gap < 1_000L) return@let   // escala: 1s (era 2s; menos latencia)
+                    // Te seguís ACERCANDO a algo (frente sube) aunque sea el mismo nivel: es un
+                    // obstáculo al que te aproximás → re-avisa pronto (c/2s). Esto mata el "llega
+                    // tarde" cuando una pared NUEVA venía justo tras otro aviso del mismo nivel.
+                    frenteSubiendo -> if (gap < 2_000L) return@let
+                    else           -> if (gap < 5_000L) return@let   // QUIETA: recordatorio suave c/5s, sin agotar
+                }
+            }
+            speak(winner.message, winner.priority, winner.interrupt)
+            if (winner.vibrateMs > 0) vibrate(winner.vibrateMs)
+            if (!winner.selfManaged) { lastDepthSpeakTime = now; lastDepthLevel = winner.level }
+            lastSpokenMsg   = winner.message
+            lastSpokenLevel = winner.level
+            lastSpeakTime   = now
         }
 
         // Descripción periódica del entorno — SOLO si no hay peligro activo y
@@ -1398,7 +1688,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             if (respuesta != null) {
                 // Gemini respondió — usar su descripción natural
                 ultimaDescGemini = respuesta
-                speak(respuesta, EventPriority.CONTEXTO)
+                speak(respuesta, EventPriority.CONTEXTO, source = SpeechSource.GEMINI)
                 Log.d(TAG, "GEMINI entorno inicial: $respuesta")
             } else {
                 // Fallback local — la lógica original sin cambios
@@ -1488,7 +1778,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     lastSceneTime       = System.currentTimeMillis()
                     // Escena cambió → limpiar objetos "ya avisados" para que se anuncien de nuevo
                     decisionEngine.resetWarnedFar()
-                    speak(respuesta, EventPriority.CONTEXTO)
+                    speak(respuesta, EventPriority.CONTEXTO, source = SpeechSource.GEMINI)
                     Log.d(TAG, "GEMINI escena actualizada: $respuesta")
                     respondioGemini = true
                 }
@@ -1537,7 +1827,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             } else null
 
             val msg = respuesta ?: "Camino bloqueado. Intenta retroceder y buscar otra ruta."
-            speak(msg, EventPriority.NAVEGACION_URGENTE)
+            speak(msg, EventPriority.NAVEGACION_URGENTE, source = if (respuesta != null) SpeechSource.GEMINI else SpeechSource.YOLO)
             Log.d(TAG, "GEMINI salida bloqueado: $msg")
             geminiRunning = false
         }
@@ -1579,17 +1869,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             lastSceneType = scene
         }
 
-        // Guía de cruce en calle: cuando hay vehículos en exterior, ofrecer escaneo lateral
-        val isExterior = scene == SceneType.EXTERIOR_TRANQUILO || scene == SceneType.EXTERIOR_CONCURRIDO
-        if (isExterior && now - lastStreetGuideTime > 40_000L && !NavigationEngine.hayPeligroActivo(tracks)) {
-            val hayVehiculos = tracks.any { it.label in VEHICLES }
-            if (hayVehiculos) {
-                speak("Vehículos detectados. Mueve el teléfono a ambos lados antes de cruzar.",
-                    EventPriority.NAVEGACION_NORMAL)
-                startScanMode("ambos lados")
-                lastStreetGuideTime = now
-            }
-        }
+        // ── ELIMINADO (pedido de Sofia, 16 Jun): la guía "Vehículos detectados. Mueve el
+        // teléfono a ambos lados antes de cruzar." NO es confiable — se disparaba con autos
+        // QUIETOS (estacionamiento) donde no hay nada que cruzar, y revivía el "escanea con el
+        // teléfono" que ya descartamos (un ciego no escanea como reflejo). Ver detección de
+        // peligro real de vehículos: los autos cercanos al frente ya se avisan por el árbitro.
     }
 
     private fun checkCrossing(tracks: List<ObjectTrack>, labels: List<String>, now: Long) {
@@ -1608,11 +1892,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val msg = when (colorSemaforo) {
             "rojo"  -> "Semáforo en rojo. Espera antes de cruzar."
             "verde" -> "Semáforo en verde. Puedes cruzar, con cuidado."
-            else    -> "Cruce detectado. Detente y escanea los lados."
+            else    -> "Cruce detectado. Detente, con cuidado."
         }
         speak(msg, EventPriority.NAVEGACION_URGENTE)
         vibrate(500L)
-        if (colorSemaforo != "verde") startScanMode("la izquierda y luego la derecha")
+        // Se quitó startScanMode (pedido de Sofia): no pedir "escanea los lados". Solo se da
+        // el dato del semáforo (rojo/verde), que solo aparece con un semáforo real detectado.
         lastCrossTime = now
     }
 
@@ -1648,6 +1933,89 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     /** Detecta pared cercana por mapa de profundidad: zona central con alta profundidad uniforme */
+    /**
+     * Distingue una BARRERA VERTICAL (pared, portón, mueble alto que bloquea el paso) de
+     * un bulto en el piso. Clave: en una barrera la cercanía SUBE por el cuadro (la franja
+     * baja Y la franja media-alta están cerca); en un bulto en el suelo, solo la franja baja
+     * está cerca y arriba hay espacio (lejos). No depende de etiqueta YOLO ni de varianza,
+     * así que cubre paredes lisas, de ladrillo, portones y esquinas que YOLO no reconoce.
+     */
+    private fun detectBarreraVertical(depthMap: Array<FloatArray>?): Boolean {
+        if (depthMap == null) return false
+        val h = depthMap.size; val w = depthMap[0].size
+        val cx0 = (w * 0.30).toInt(); val cx1 = (w * 0.70).toInt()
+        fun bandAvg(ya: Double, yb: Double): Float {
+            val y0 = (h * ya).toInt(); val y1 = (h * yb).toInt()
+            var s = 0f; var c = 0
+            for (y in y0 until y1 step 3) for (x in cx0 until cx1 step 3) { s += depthMap[y][x]; c++ }
+            return if (c > 0) s / c else 0f
+        }
+        val low   = bandAvg(0.60, 0.85)   // franja baja (piso a tus pies / base)
+        val mid   = bandAvg(0.35, 0.55)   // franja media (altura del torso)
+        val upper = bandAvg(0.10, 0.30)   // franja alta (adelante: en camino abierto = LEJOS)
+
+        // CASO 1 — barrera cercana fuerte: la franja baja muy cerca y la media también.
+        val barreraCercana = low >= DEPTH_PELIGRO && mid >= DEPTH_CERCA && mid > low - 0.14f
+
+        // CASO 2 — "se acabó el espacio adelante" (avisa ANTES, no depende de cercanía
+        // absoluta). En camino abierto hay gradiente: piso cerca, frente lejos → (low-upper)
+        // grande y upper bajo (lejos). Si el frente se llena (pared/clóset/estante), el
+        // gradiente se aplana y la franja alta deja de estar lejos. Más robusto con MiDaS,
+        // que no clava la distancia de una pared lisa pero sí nota que no hay zona lejana.
+        val sinEspacioAdelante = mid >= DEPTH_AVISO && upper >= DEPTH_AVISO && (low - upper) < 0.12f
+
+        return barreraCercana || sinEspacioAdelante
+    }
+
+    /** Cercanía promedio del frente (zona central). Sirve para graduar la urgencia de una
+     *  pared/barrera —incluida la pared lisa que detectObstaculoCercanoSinYolo descarta por
+     *  baja varianza— y decidir si el aviso debe escalar a "¡Detente!" crítico. */
+    private fun frenteCercania(depthMap: Array<FloatArray>?): Float {
+        if (depthMap == null) return 0f
+        val h = depthMap.size; val w = depthMap[0].size
+        val y0 = (h * 0.30).toInt(); val y1 = (h * 0.72).toInt()
+        val x0 = (w * 0.32).toInt(); val x1 = (w * 0.68).toInt()
+        var s = 0f; var c = 0
+        for (y in y0 until y1 step 3) for (x in x0 until x1 step 3) { s += depthMap[y][x]; c++ }
+        return if (c > 0) s / c else 0f
+    }
+
+    /**
+     * Detecta una BARRERA VERTICAL CERCANA (pared lisa, columna) mirando el PISO, no la pared.
+     * Idea (mentor + visión): MiDaS no mide la distancia absoluta a una superficie lisa, pero el
+     * gradiente del piso SÍ es confiable. En camino abierto hay un tramo largo de piso que se
+     * aleja delante tuyo (los pies cerca, el frente medio lejos → gran diferencia de profundidad).
+     * Si una columna/pared te bloquea, el piso "se corta" cerca: el frente medio (a la altura del
+     * torso, ~2-3m) ya está CERCA y el piso no alcanza a alejarse → poca diferencia pies-frente.
+     * Así distingue:
+     *   • Pared LEJANA (fondo de cuarto) → frente medio LEJOS → no dispara (sin falso positivo).
+     *   • Columna/pared CERCANA que bloquea → frente medio cerca + piso cortado → dispara ANTES
+     *     de tener que pegarte, sin depender de medir la distancia exacta a la pared lisa.
+     * Se exige ADEMÁS que el usuario se esté acercando (gate frenteSubiendo) para no avisar de
+     * una pared a la que no caminás. Devuelve true = hay superficie vertical cercana cortando el paso.
+     */
+    private fun detectBloqueoCercano(depthMap: Array<FloatArray>?): Boolean {
+        if (depthMap == null) return false
+        val h = depthMap.size; val w = depthMap[0].size
+        val cx0 = (w * 0.38).toInt(); val cx1 = (w * 0.62).toInt()
+        fun band(ya: Double, yb: Double): Float {
+            val y0 = (h * ya).toInt(); val y1 = (h * yb).toInt()
+            var s = 0f; var c = 0
+            for (y in y0 until y1 step 3) for (x in cx0 until cx1 step 3) { s += depthMap[y][x]; c++ }
+            return if (c > 0) s / c else 0f
+        }
+        val dFloor = band(0.80, 0.93)   // piso/base INMEDIATA a tus pies: si ves piso real, es cercano
+        val dAhead = band(0.42, 0.60)   // frente medio (~2-3m a nivel torso/piso): la zona clave
+        // Necesita TRES cosas para disparar (anti-falso-positivo de "pared lejana que llena el
+        // cuadro" — confirmado por Sofia, límite de cámara monocular/FOV angosto):
+        //   1. dFloor genuinamente CERCA (>= DEPTH_PELIGRO): ves piso/base próxima. Si TODA la
+        //      pantalla es una pared lejana uniforme, MiDaS la lee "moderada" → dFloor NO llega
+        //      a estar cerca → NO dispara (mata el falso positivo de la pared a pantalla completa).
+        //   2. El frente medio también cerca (superficie vertical cortando el paso).
+        //   3. El piso no se alejó hacia el frente (poca diferencia = el piso se cortó cerca).
+        return dFloor >= DEPTH_PELIGRO && dAhead >= DEPTH_CERCA && (dFloor - dAhead) < 0.12f
+    }
+
     private fun detectParedAlFrente(depthMap: Array<FloatArray>?): Boolean {
         if (depthMap == null) return false
         val h = depthMap.size; val w = depthMap[0].size
@@ -1687,22 +2055,74 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return if (variance >= 0.005f) avg else 0f
     }
 
-    /** Detecta escalones por patrón de gradiente alternante en la franja inferior del mapa */
+    /**
+     * Detecta obstáculos a ras del suelo (piedra, cable, bulto, escalón bajo) comparando
+     * la profundidad del centro del camino con los laterales a la misma altura.
+     * Si el centro está significativamente más "cerca" que los bordes → hay algo en el suelo.
+     * Devuelve la profundidad del obstáculo (0–1), o 0f si el camino está libre.
+     */
+    private fun detectObstaculoEnSuelo(depthMap: Array<FloatArray>?): Float {
+        if (depthMap == null) return 0f
+        val h = depthMap.size; val w = depthMap[0].size
+
+        // Franja inferior del frame: donde aparecen objetos en el suelo a 1–3m.
+        // Extendida hasta 0.90 (antes 0.85) para cazar objetos BAJOS (mesita de noche, banco)
+        // que a altura normal del teléfono quedan cerca del borde inferior — la inconsistencia
+        // "a veces sí, a veces no según el ángulo" que reportó Sofia. La comparación
+        // centro-vs-lados sigue evitando el falso positivo en piso abierto (validado por oído).
+        val y0 = (h * 0.62).toInt(); val y1 = (h * 0.90).toInt()
+        if (y1 <= y0) return 0f
+
+        // Centro del camino (30%–70% horizontal)
+        val cx0 = (w * 0.30).toInt(); val cx1 = (w * 0.70).toInt()
+        // Laterales del mismo nivel como referencia de "suelo limpio" (5%–25% y 75%–95%)
+        val lx0 = (w * 0.05).toInt(); val lx1 = (w * 0.25).toInt()
+        val rx0 = (w * 0.75).toInt(); val rx1 = (w * 0.95).toInt()
+
+        var centerSum = 0f; var centerCount = 0
+        var sideSum   = 0f; var sideCount   = 0
+
+        for (y in y0 until y1 step 3) {
+            for (x in cx0 until cx1 step 3) { centerSum += depthMap[y][x]; centerCount++ }
+            for (x in lx0 until lx1 step 3) { sideSum += depthMap[y][x]; sideCount++ }
+            for (x in rx0 until rx1 step 3) { sideSum += depthMap[y][x]; sideCount++ }
+        }
+        if (centerCount == 0 || sideCount == 0) return 0f
+
+        val centerAvg = centerSum / centerCount
+        val sideAvg   = sideSum   / sideCount
+
+        // Dispara si el centro del camino está NOTABLEMENTE más cerca que el piso a los lados
+        // (umbral 0.11, antes 0.14 → caza objetos bajos como una mesita que antes se le escapaban),
+        // O si el centro-bajo está muy cerca en absoluto (objeto que llena el ancho y no deja
+        // "piso lateral" de referencia). El árbitro por escalada evita que esto se vuelva metralleta.
+        return if (centerAvg > sideAvg + 0.11f || centerAvg >= DEPTH_CRITICO) centerAvg else 0f
+    }
+
+    /** Detecta escalones por patrón de gradiente alternante en la franja inferior del mapa.
+     *  Umbral elevado (0.065) para evitar falsos positivos con pisos texturizados (terracota, etc). */
     private fun detectEscalonesAdelante(depthMap: Array<FloatArray>?): Boolean {
         if (depthMap == null) return false
         val h = depthMap.size; val w = depthMap[0].size
-        val cx = w / 2
         val step = (h / 22).coerceAtLeast(1)
-        var transitions = 0; var prevSlope = 0f
-        var prevDepth = depthMap[(h * 0.50).toInt().coerceIn(0, h - 1)][cx]
 
-        for (yi in (h * 0.50).toInt() until (h * 0.92).toInt() step step) {
-            val depth = depthMap[yi.coerceIn(0, h - 1)][cx]
-            val slope = depth - prevDepth
-            if (abs(slope) > 0.040f && slope * prevSlope < 0f) transitions++
-            prevSlope = slope; prevDepth = depth
+        // Verificar 3 columnas: izquierda, centro y derecha
+        val cols = listOf(w / 4, w / 2, 3 * w / 4)
+        var colsWithTransitions = 0
+
+        for (cx in cols) {
+            var transitions = 0; var prevSlope = 0f
+            var prevDepth = depthMap[(h * 0.50).toInt().coerceIn(0, h - 1)][cx]
+            for (yi in (h * 0.50).toInt() until (h * 0.92).toInt() step step) {
+                val depth = depthMap[yi.coerceIn(0, h - 1)][cx]
+                val slope = depth - prevDepth
+                if (abs(slope) > 0.065f && slope * prevSlope < 0f) transitions++
+                prevSlope = slope; prevDepth = depth
+            }
+            if (transitions >= 3) colsWithTransitions++
         }
-        return transitions >= 2
+        // Requiere que al menos 2 de las 3 columnas muestren el patrón de escalón
+        return colsWithTransitions >= 2
     }
 
     // ── Vibración ─────────────────────────────────────────────────────────────
@@ -1713,6 +2133,98 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         else @Suppress("DEPRECATION") vibrator.vibrate(ms)
     }
 
+    /** Vibración de confirmación de interacción (botón) — independiente de la preferencia de navegación. */
+    private fun vibrateCue(ms: Long) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+        else @Suppress("DEPRECATION") vibrator.vibrate(ms)
+    }
+
+    // ── Asistente de voz para ajustes ─────────────────────────────────────────
+
+    /**
+     * Activado con pulsación larga sobre el botón de configuración.
+     * Escucha un comando hablado ("activa la vibración", "habla más lento"...)
+     * y lo aplica de inmediato sin necesidad de entrar al menú de ajustes.
+     */
+    private fun startVoiceCommand() {
+        if (listeningForCommand) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 12)
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            speak("El reconocimiento de voz no está disponible en este dispositivo.", EventPriority.CONTEXTO, interrupt = true)
+            return
+        }
+
+        // Al invocar el asistente: CORTAR toda la voz de navegación en curso y vaciar la cola.
+        // La usuaria está por configurar algo — no debe oír alertas encima. El flag
+        // listeningForCommand (chequeado en speak()) impide que se encolen nuevas mientras escucha.
+        listeningForCommand = true
+        if (::tts.isInitialized && tts.isSpeaking) tts.stop()
+        if (::ttsQueue.isInitialized) ttsQueue.clear()
+        vibrateCue(80)
+        runOnUiThread {
+            sourceIndicator.text = "🎙️ Escuchando comando..."
+            sourceIndicator.setTextColor(Color.parseColor("#FF4444"))
+            sourceIndicator.visibility = View.VISIBLE
+        }
+
+        val recognizer = speechRecognizer
+            ?: SpeechRecognizer.createSpeechRecognizer(this).also { speechRecognizer = it }
+
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(results: Bundle?) {
+                listeningForCommand = false
+                val texto = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (texto != null) procesarComandoDeVoz(texto)
+                else speak("No entendí el comando. Mantén presionado el botón e intenta de nuevo.", EventPriority.CONTEXTO, interrupt = true, force = true)
+            }
+            override fun onError(error: Int) {
+                listeningForCommand = false
+                speak("No pude escucharte bien. Intenta de nuevo.", EventPriority.CONTEXTO, interrupt = true, force = true)
+            }
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-MX")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        recognizer.startListening(intent)
+    }
+
+    /** Interpreta el texto reconocido, aplica el cambio de preferencia y confirma por voz. */
+    private fun procesarComandoDeVoz(texto: String) {
+        Log.d(TAG, "Comando de voz recibido: $texto")
+        val confirmacion = VoiceSettingsAssistant.procesarComando(texto, userPrefs)
+        if (confirmacion != null) {
+            // Cambios de velocidad/tono deben reflejarse de inmediato en la cola TTS activa
+            if (::ttsQueue.isInitialized) {
+                ttsQueue.userSpeedMultiplier = userPrefs.getSpeechRate()
+                ttsQueue.userPitch           = userPrefs.getPitch()
+            }
+            // force=true: la confirmación SIEMPRE se oye, aunque el modo silencioso esté activo
+            // (ej. el usuario lo activa y debe escuchar "solo vibraré"; o lo desactiva).
+            speak(confirmacion, EventPriority.CONTEXTO, interrupt = true, force = true)
+        } else {
+            speak(
+                "No reconocí ese ajuste. Puedes decir, por ejemplo: activa la vibración, " +
+                    "ajusta la voz a más lenta, o cambia la distancia de alerta a dos metros.",
+                EventPriority.CONTEXTO, interrupt = true, force = true
+            )
+        }
+    }
+
     // ── Flash ─────────────────────────────────────────────────────────────────
     private fun controlTorch(bitmap: Bitmap) {
         brightHistory.addLast(calcBrightness(bitmap))
@@ -1721,9 +2233,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val avg = brightHistory.average().toInt()
         val now = System.currentTimeMillis()
         if (now - lastTorchChg < TORCH_DEBOUNCE) return
+        // APAGADO: el sensor de luz ambiental (lux) es la señal correcta — mide la luz del
+        // entorno SIN contar la propia linterna. El método por brillo de imagen no apagaba al
+        // salir de un lugar oscuro a uno claro (la linterna inflaba el brillo / no alcanzaba el
+        // umbral). Si hay sensor de luz y el ambiente está claro (lux alto) → apagar. Si no hay
+        // sensor, se cae al brillo de imagen como antes. (Reporte de Sofia: enciende bien en lo
+        // oscuro pero no se apagaba al volver a la claridad.)
+        val ambienteClaro = (ambientLux >= 0f && ambientLux > LUX_OFF_THRESH) || avg > TORCH_OFF_THRESH
         when {
-            avg < DARK_THRESHOLD  && !isTorchOn -> { camera?.cameraControl?.enableTorch(true);  isTorchOn = true;  lastTorchChg = now; brightHistory.clear() }
-            avg > TORCH_OFF_THRESH && isTorchOn -> { camera?.cameraControl?.enableTorch(false); isTorchOn = false; lastTorchChg = now; brightHistory.clear() }
+            avg < DARK_THRESHOLD && !isTorchOn -> { camera?.cameraControl?.enableTorch(true);  isTorchOn = true;  lastTorchChg = now; brightHistory.clear() }
+            ambienteClaro        &&  isTorchOn -> { camera?.cameraControl?.enableTorch(false); isTorchOn = false; lastTorchChg = now; brightHistory.clear() }
         }
     }
 
@@ -1743,10 +2262,43 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
     }
 
-    private fun speak(text: String, priority: EventPriority = EventPriority.NAVEGACION_NORMAL) {
+    private fun speak(
+        text: String,
+        priority: EventPriority = EventPriority.NAVEGACION_NORMAL,
+        interrupt: Boolean = false,
+        source: SpeechSource = SpeechSource.YOLO,
+        force: Boolean = false
+    ) {
         if (!ttsReady) return
-        ttsQueue.enqueue(NavEvent(text, priority))
+        if (!force) {
+            // 1) ASISTENTE DE VOZ ACTIVO: mientras se invoca/escucha un comando, la navegación
+            //    se calla por completo — la usuaria está configurando y no quiere alertas encima.
+            //    Las respuestas del propio asistente pasan con force=true.
+            if (listeningForCommand) return
+            // 2) MODO SILENCIOSO: la app NO habla, solo vibra (la vibración va aparte con vibrate()).
+            //    Antes la preferencia se guardaba pero speak() nunca la consultaba → decía
+            //    "solo vibraré" y seguía hablando (rompía la confianza del usuario ciego).
+            if (this::userPrefs.isInitialized && userPrefs.modoSilencioso) return
+        }
+        ttsQueue.enqueue(NavEvent(text, priority, interruptSpeech = interrupt, source = source))
         lastSpeakTime = System.currentTimeMillis()
+    }
+
+    /** Actualiza el indicador visual con quién está hablando: detección rápida (YOLO) o IA (Gemini). */
+    private fun showSpeechSource(source: SpeechSource) {
+        runOnUiThread {
+            when (source) {
+                SpeechSource.YOLO -> {
+                    sourceIndicator.text = "⚡ Detección rápida"
+                    sourceIndicator.setTextColor(Color.parseColor("#00BFFF"))
+                }
+                SpeechSource.GEMINI -> {
+                    sourceIndicator.text = "🤖 IA (Gemini)"
+                    sourceIndicator.setTextColor(Color.parseColor("#FFD700"))
+                }
+            }
+            sourceIndicator.visibility = View.VISIBLE
+        }
     }
 
     private fun requestGpsPermissionIfNeeded() {
@@ -1760,6 +2312,35 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * Respaldo físico para activar el asistente de voz: mantener presionados ambos
+     * botones de volumen a la vez. Más fácil de ubicar al tacto que la pantalla
+     * (ej. con guantes, funda, o el teléfono dentro de un bolsillo).
+     * Solo se consume el evento (bloqueando el cambio de volumen) cuando se detecta
+     * la combinación — una pulsación normal de un solo botón sigue ajustando el volumen.
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) volUpPressed = true
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) volDownPressed = true
+            if (volUpPressed && volDownPressed && !volChordFired) {
+                volChordFired = true
+                startVoiceCommand()
+                return true  // consumir — evita que cambie el volumen al activar el asistente
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP   -> volUpPressed = false
+            KeyEvent.KEYCODE_VOLUME_DOWN -> volDownPressed = false
+        }
+        if (!volUpPressed && !volDownPressed) volChordFired = false
+        return super.onKeyUp(keyCode, event)
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
@@ -1770,12 +2351,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 } else finish()
             }
             11 -> Unit  // GPS es opcional — SessionManager verifica el permiso al usarlo
+            12 -> if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startVoiceCommand()
+            } else {
+                speak("Necesito permiso del micrófono para escuchar comandos de ajustes.", EventPriority.CONTEXTO)
+            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         sessionManager.stopSession()
+        speechRecognizer?.destroy()
         if (::tts.isInitialized) tts.shutdown()
         yoloDetector.close(); depthEstimator?.close()
         cameraExecutor.shutdown(); depthExecutor.shutdown()

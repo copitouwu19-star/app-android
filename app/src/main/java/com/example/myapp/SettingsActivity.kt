@@ -7,6 +7,7 @@ import android.speech.tts.Voice
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -33,12 +34,33 @@ class SettingsActivity : AppCompatActivity() {
         Si el teléfono no detecta movimiento por 12 segundos, entra en pausa para ahorrar batería. Muévete para reactivarlo.
     """.trimIndent()
 
+    private val textoAsistente = """
+        Asistente de voz. Para abrirlo, mantén presionada la pantalla, o presiona los dos botones de volumen a la vez. Cuando escuches el tono, di tu instrucción.
+        Puedes decir: activa o desactiva el modo silencioso. Activa o apaga la vibración. Habla más rápido o más lento. Avisa a dos metros, a un metro, o a medio metro. O cambia el tono de voz a cálido, grave, animado, suave o natural.
+        Al abrir el asistente, las alertas de navegación se silencian para que puedas configurar con tranquilidad.
+    """.trimIndent()
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Aplicar el tema guardado ANTES de inflar la vista (claro/oscuro para la demo).
+        AppCompatDelegate.setDefaultNightMode(
+            if (UserPreferences(this).temaOscuro) AppCompatDelegate.MODE_NIGHT_YES
+            else AppCompatDelegate.MODE_NIGHT_NO
+        )
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
         prefs = UserPreferences(this)
 
+        val swTema = findViewById<Switch>(R.id.switchTema)
+        swTema.isChecked = prefs.temaOscuro
+        swTema.setOnCheckedChangeListener { _, checked ->
+            prefs.temaOscuro = checked
+            AppCompatDelegate.setDefaultNightMode(
+                if (checked) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO
+            )
+        }
+
         val swVib    = findViewById<Switch>(R.id.switchVibracion)
+        val swSil    = findViewById<Switch>(R.id.switchSilencioso)
         val rgDist   = findViewById<RadioGroup>(R.id.rgDistancia)
         val rgVoz    = findViewById<RadioGroup>(R.id.rgVelocidad)
         val rgTono   = findViewById<RadioGroup>(R.id.rgTono)
@@ -50,6 +72,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // ── Cargar valores guardados ──────────────────────────────────────────
         swVib.isChecked = prefs.vibracionActivada
+        swSil.isChecked = prefs.modoSilencioso
         when (prefs.distanciaAlerta) {
             "0.5m" -> rgDist.check(R.id.rb05m)
             "2m"   -> rgDist.check(R.id.rb2m)
@@ -70,6 +93,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // ── Guardar cambios al instante ───────────────────────────────────────
         swVib.setOnCheckedChangeListener { _, checked -> prefs.vibracionActivada = checked }
+        swSil.setOnCheckedChangeListener { _, checked -> prefs.modoSilencioso = checked }
         rgDist.setOnCheckedChangeListener { _, id ->
             prefs.distanciaAlerta = when (id) {
                 R.id.rb05m -> "0.5m"
@@ -98,6 +122,15 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         btnClose.setOnClickListener { finish() }
+        findViewById<Button>(R.id.btnCerrarTop).setOnClickListener { finish() }
+
+        // ── Escuchar cómo usar el asistente de voz (lectura por TTS) ──────────
+        findViewById<Button>(R.id.btnEscucharAsistente).setOnClickListener {
+            if (!ttsReady) return@setOnClickListener
+            tts?.setSpeechRate(prefs.getSpeechRate())
+            tts?.setPitch(prefs.getPitch())
+            tts?.speak(textoAsistente, TextToSpeech.QUEUE_FLUSH, null, "ayuda_asistente")
+        }
 
         // ── TTS ───────────────────────────────────────────────────────────────
         tts = TextToSpeech(this) { status ->

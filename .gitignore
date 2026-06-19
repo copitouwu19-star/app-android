@@ -1,6 +1,8 @@
 *.iml
 .gradle
 /local.properties
+# Modelos IA — archivos binarios grandes, no van en git
+*.tflite
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
@@ -13,3 +15,10 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Material de trabajo local — NO va al repo (videos de prueba, modelo Vosk, notas)
+/revisar/
+conversa_*.txt
+conversa_*.xt
+commit_push.ps1
+/.claude/

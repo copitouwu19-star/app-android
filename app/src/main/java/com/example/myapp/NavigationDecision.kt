@@ -31,7 +31,7 @@ private val FURNITURE_OBJS = setOf(
     "bed","bench","toilet","houseplant","plant","television","refrigerator","microwave oven","oven","sink",
     "chest of drawers","nightstand","wardrobe","bookcase","desk","cabinetry","bathroom cabinet",
     "cupboard","shelf","filing cabinet","stool","lamp","mirror","dishwasher","washing machine",
-    "fireplace","waste container","infant bed"
+    "fireplace","waste container","infant bed","pillow","laptop","computer monitor","box","barrel"
 )
 
 fun inferScene(labels: List<String>, areas: List<Float>): SceneType {
@@ -134,8 +134,8 @@ object NavigationEngine {
                     NavDecision("Detente. $obj al frente. Gira a la derecha.",
                         EventPriority.PELIGRO_INMEDIATO, 800L)
                 else ->
-                    NavDecision("Detente. $obj bloqueando. Mueve el teléfono a los lados.",
-                        EventPriority.PELIGRO_INMEDIATO, 800L, requestScan = true)
+                    NavDecision("Detente. $obj al frente.",
+                        EventPriority.PELIGRO_INMEDIATO, 800L)
             }
         }
 
@@ -237,16 +237,19 @@ class DecisionEngine {
         val message: String,
         val priority: EventPriority,
         val vibrateMs: Long = 0L,
-        val requestScan: Boolean = false
+        val requestScan: Boolean = false,
+        val interruptSpeech: Boolean = false
     )
 
     private var lastSig: String?    = null
     private var lastLevel: Int      = -1
     private var lastSpeakTime: Long = 0L
-    private var speakCount: Int     = 0
-    // Contador separado para grupos (persiste aunque cambie la dirección)
-    private var groupSpeakCount: Int  = 0
-    private var lastGroupLabel: String = ""
+    // Reloj propio del anuncio de puerta/landmark — inmune a cualquier otro reset.
+    private var lastDoorAnnounce: Long = 0L
+    // Máximo nivel de peligro ANUNCIADO recientemente. Da histéresis: si la distancia
+    // jitterea y el peligro rebota 4↔3↔4, solo el primer 4 es "escalón"; los rebotes
+    // posteriores NO re-disparan. Se re-arma tras un rato de calma. (Fase E)
+    private var recentMaxLevel: Int = -1
 
     private val warnedFarObjects = mutableSetOf<String>()
 
@@ -294,14 +297,20 @@ class DecisionEngine {
         val mainTrack  = centerMain ?: confirmed.maxByOrNull { it.depthScore } ?: return null
         val centerBlocked = centerMain != null && centerMain.depthScore >= DEPTH_CERCA
 
+        // Punto de referencia (ej. puerta): se informa su presencia, no se esquiva.
+        val isLandmark = mainTrack.label in LANDMARK_OBJECTS
+
         // Vehículo estacionado: sin movimiento lateral ni de acercamiento → baja prioridad
         val isParkedVehicle = mainTrack.label in VEHICLES &&
             kotlin.math.abs(mainTrack.vx) < 0.015f &&
             kotlin.math.abs(mainTrack.vy) < 0.015f &&
             !mainTrack.isApproaching && mainTrack.framesTracked >= 4
 
-        val danger = if (isParkedVehicle) minOf(mainTrack.dangerLevel.coerceAtLeast(0), 1)
-                     else mainTrack.dangerLevel.coerceAtLeast(0)
+        val danger = when {
+            isParkedVehicle -> minOf(mainTrack.dangerLevel.coerceAtLeast(0), 1)
+            isLandmark      -> minOf(mainTrack.dangerLevel.coerceAtLeast(0), 1) // nunca "detente"
+            else            -> mainTrack.dangerLevel.coerceAtLeast(0)
+        }
 
         // ── 4. Clústering: 3+ muebles juntos → se anuncian como grupo con nombre específico.
         //       "grupo de sillas" en vez de "silla, silla, silla...". ──
@@ -324,23 +333,32 @@ class DecisionEngine {
         val groupLabel = if (isGroup) "grupo de $objName" else objName
 
         // ── 5. Dirección recomendada (corta y accionable) ──
+        // Para peligro crítico/inmediato (danger >= 3): solo sugerir una dirección específica
+        // si hay tracks visibles en ese lado que confirmen que el espacio es real.
+        // Sin tracks al costado = la cámara no vio ese lado = no sabemos si está libre.
+        val lHasTrackData = left.isNotEmpty()
+        val rHasTrackData = right.isNotEmpty()
+
+        // Política conservadora (decisión del usuario): NUNCA mandar hacia un lado
+        // adivinado. Solo sugerir dirección con EVIDENCIA FUERTE = un lado observado
+        // libre (tiene tracks que confirman espacio) Y el otro observado bloqueado.
+        // Sin esa certeza → "Detente" a secas. Parar nunca te hace chocar; mandarte a
+        // un lado que la cámara no vio, sí (fue el bug de la prueba 1: "izquierda" hacia
+        // lo bloqueado). "Escanea/mueve el teléfono" queda eliminado: un ciego no puede
+        // escanear como reflejo y la frase larga retrasaba el "Detente" crítico.
         val dir = when {
+            isLandmark       -> "centro"   // sin instrucción de evasión para puntos de referencia
             !centerBlocked   -> "centro"
-            lClear && rClear -> "ambos"
-            lClear           -> "izquierda"
-            rClear           -> "derecha"
-            else             -> "bloqueado"
+            lClear && lHasTrackData && !rClear -> "izquierda"
+            rClear && rHasTrackData && !lClear -> "derecha"
+            else             -> "ninguno"  // sin certeza → solo "Detente"
         }
-        // "ambos" = ambos lados libres → elegir el que tenga menos objetos (o izquierda por defecto).
         val dirPhrase = when (dir) {
             "izquierda" -> " Muévete a la izquierda."
             "derecha"   -> " Muévete a la derecha."
-            "ambos"     -> if (left.size <= right.size) " Muévete a la izquierda."
-                           else " Muévete a la derecha."
-            "bloqueado" -> " Detente. Mueve el teléfono para encontrar una salida."
             else        -> ""
         }
-        val requestScan = dir == "bloqueado"
+        val requestScan = false
 
         // ── 6. Mensaje CORTO según nivel de peligro ──
         val msg: String
@@ -348,14 +366,24 @@ class DecisionEngine {
         var vibrateMs = 0L
 
         when {
+            isLandmark -> {
+                // Puerta u otro punto de referencia: solo "Puerta enfrente / a la izquierda".
+                // Sin "detente", sin dirección de evasión, sin vibración. Conciencia, no orden.
+                val loc = if (mainTrack.zone == "centro") "enfrente" else "a la ${mainTrack.zone}"
+                msg = "${groupLabel.replaceFirstChar { it.uppercaseChar() }} $loc."
+                priority = EventPriority.NAVEGACION_NORMAL
+            }
             danger >= 4 -> {
                 msg = "¡Detente! $groupLabel muy cerca.$dirPhrase".trim()
                 priority = EventPriority.CRITICO; vibrateMs = 1000L
             }
             danger >= 3 -> {
+                // ~2-2.5m: aviso CLARO pero SIN "Detente". El "Detente" se reserva para
+                // peligro inminente (danger 4, ~1.3m), como pidió la usuaria: no alarmar
+                // cuando todavía hay margen. Si hay lado libre se sugiere; si no, solo el aviso.
                 val loc3 = if (mainTrack.zone == "centro") "al frente" else "a la ${mainTrack.zone}"
-                msg = "Detente. $groupLabel $loc3.$dirPhrase".trim()
-                priority = EventPriority.PELIGRO_INMEDIATO; vibrateMs = 700L
+                msg = "$groupLabel $loc3.$dirPhrase".trim()
+                priority = EventPriority.PELIGRO_INMEDIATO; vibrateMs = 400L
             }
             danger >= 2 -> {
                 if (centerBlocked) {
@@ -396,74 +424,91 @@ class DecisionEngine {
             }
         }
 
-        // ── 7. Anti-repetición por firma + warn-once para lejanos ──
-        val sig          = "$groupLabel|$dir|$danger"
-        val escalated    = danger > lastLevel
-        val newSituation = sig != lastSig
-        val userMoved    = (now - lastMotionTime) < 3_000L
-        val timeSince    = now - lastSpeakTime
+        // ── 7. Anti-repetición: throttle por NIVEL DE PELIGRO, no por objeto ──
+        // CAUSA RAÍZ del "detente detente detente" y del grupo que no termina la frase:
+        // antes cada guardia estaba atada al NOMBRE del objeto. En un cuarto con fondo
+        // (silla + persona + comedor) el "principal" parpadea frame a frame, y cada
+        // cambio de nombre reseteaba contadores y saltaba los cooldowns → volvía a
+        // hablar. Ahora hablamos por PELIGRO SOSTENIDO, no por cada objeto que aparece:
+        // un solo reloj global que NO depende de qué objeto sea el principal.
+        val timeSince = now - lastSpeakTime
 
-        // Gestión del contador de grupo: persiste aunque cambie la dirección
-        if (isGroup) {
-            if (groupLabel != lastGroupLabel) { groupSpeakCount = 0; lastGroupLabel = groupLabel }
-        } else {
-            groupSpeakCount = 0; lastGroupLabel = ""
+        // Histéresis (Fase E): tras 6s de calma, olvidamos el peligro reciente y volvemos
+        // a permitir un salto limpio. Confirmado por video: la distancia de la silla
+        // saltaba 1.4m↔2.8m → peligro 4↔3 → antes cada re-subida era "escalón" → ráfaga.
+        if (timeSince > 6_000L) recentMaxLevel = -1
+
+        // Escalón REAL = supera el MÁXIMO reciente (no un rebote a un nivel ya visto) y
+        // se sostuvo ≥2 frames. Primer salto a crítico = peligro inminente nuevo.
+        val escalated     = danger > recentMaxLevel && mainTrack.dangerFrames >= 2
+        val firstCritical = danger >= 4 && recentMaxLevel < 4 && mainTrack.dangerFrames >= 2
+
+        // Punto de referencia (puerta): UNA vez por aproximación, con reloj propio que
+        // ningún otro reset puede tocar. Se re-arma tras 8s (el usuario se alejó y volvió).
+        if (isLandmark) {
+            if (now - lastDoorAnnounce < 8_000L) return null
+            lastDoorAnnounce = now
+            lastLevel = danger; lastSpeakTime = now
+            return SpeakDecision(msg, priority, 0L, false, interruptSpeech = false)
         }
 
-        // Al cambiar situación o escalar → reiniciar contador de repeticiones individuales
-        if (newSituation || escalated) speakCount = 0
-
-        // Objetos lejanos (danger 0): se anuncian una sola vez por escena.
-        if (danger == 0 && sig in warnedFarObjects && !escalated) return null
-
-        // Piso anti-spam general: si solo cambió el nombre (no escaló), espera 2s.
-        if (danger in 1..2 && newSituation && !escalated && timeSince < 2_000L) return null
-
-        // Anti-spam GRUPOS: cooldown por nivel que aplica INCLUSO al escalar.
-        // Esto corrige "detente detente detente" cuando la persona se acerca a un grupo:
-        // cada escalación (1→2→3→4) ya no dispara el aviso instantáneamente.
-        if (isGroup) {
-            val groupCooldown = when {
-                danger >= 4 -> 3_000L    // crítico: mínimo 3s entre avisos
-                danger >= 3 -> 5_000L    // peligro: mínimo 5s
-                else        -> 10_000L   // aviso/cerca: mínimo 10s
-            }
-            if (timeSince < groupCooldown) return null
+        // Objetos lejanos (danger 0): una sola vez por objeto y por escena.
+        if (danger == 0) {
+            val sig = "$groupLabel|0"
+            if (sig in warnedFarObjects && !escalated) return null
+            warnedFarObjects.add(sig)
+            lastSig = sig; lastLevel = danger; lastSpeakTime = now
+            return SpeakDecision(msg, priority, 0L, false, interruptSpeech = false)
         }
 
-        // Límite de repeticiones: danger 4 (crítico) → máx 3; danger 1-3 → máx 2.
-        val effectiveCount = if (isGroup) groupSpeakCount else speakCount
-        if (danger >= 4 && effectiveCount >= 3 && !escalated) return null
-        if (danger in 1..3 && effectiveCount >= 2 && !escalated) return null
+        // Cooldown único por nivel — global, NO atado al nombre del objeto.
+        val cooldown = when {
+            danger >= 4 -> 2_500L   // crítico: recordatorio cada 2.5s mientras siga el peligro
+            danger >= 3 -> 3_500L   // "detente": cada 3.5s
+            danger >= 2 -> 6_000L   // "desvíate": más espaciado
+            else        -> 9_000L   // aviso suave
+        }
 
+        // ¿Hablar? Brecha mínima de 1.5s entre CUALQUIER par de avisos → nunca dos
+        // pegados (mata las ráfagas y los cortes a media palabra), salvo el primer
+        // salto a crítico real (peligro inminente nuevo), que siempre pasa.
+        //
+        // Repetir un aviso de peligro SOLO si el objeto se está ACERCANDO de verdad
+        // (velocidad de profundidad suavizada). YA NO usamos el sensor de movimiento del
+        // teléfono: el simple temblor de la mano superaba su umbral y hacía creer que el
+        // usuario caminaba → repetía "detente, cama muy cerca" estando PARADO (caso Sofia).
+        // Parado frente a un mueble que no se acerca → se dice UNA vez y se calla; al
+        // caminar hacia él, vDepth sube y el aviso se reanuda. Umbral 0.02 (> jitter típico).
+        val gettingCloser = mainTrack.vDepth > 0.02f
         val speak = when {
-            danger >= 4 -> timeSince > COOLDOWN_CRITICO
-            danger >= 3 -> newSituation || escalated || (mainTrack.isApproaching && timeSince > 4_000L)
-            danger >= 1 -> newSituation || escalated || (!userMoved && timeSince > REPEAT_IF_NO_MOVE_MS)
-            else        -> newSituation
+            firstCritical      -> true
+            timeSince < 1_500L -> false
+            escalated          -> true
+            else               -> gettingCloser && timeSince >= cooldown
         }
         if (!speak) return null
 
-        // Vibración: 1.° aviso = solo voz, 2.° = vibración, 3.° = solo voz (todos los niveles).
-        val finalVibrateMs = if (effectiveCount == 1) vibrateMs else 0L
+        // Vibración solo en el primer aviso de cada escalón real, no en cada repetición.
+        val finalVibrateMs = if (escalated || firstCritical) vibrateMs else 0L
 
-        if (danger == 0) warnedFarObjects.add(sig)
-        lastSig       = sig
-        lastLevel     = danger
-        lastSpeakTime = now
-        if (isGroup) groupSpeakCount++ else speakCount++
+        lastSig        = "$groupLabel|$danger"
+        lastLevel      = danger
+        lastSpeakTime  = now
+        recentMaxLevel = maxOf(recentMaxLevel, danger)
 
-        android.util.Log.d(TAG, "SPEAK danger=$danger dir=$dir obj=$groupLabel count=$effectiveCount isGroup=$isGroup msg='$msg'")
-        return SpeakDecision(msg, priority, finalVibrateMs, requestScan)
+        android.util.Log.d(TAG, "SPEAK danger=$danger dir=$dir obj=$groupLabel esc=$escalated fc=$firstCritical msg='$msg'")
+        // Interrumpir el habla en curso SOLO en el salto real a crítico acercándose —
+        // una vez, no en cada rebote 3↔4 (eso cortaba la frase a media palabra).
+        val doInterrupt = firstCritical && mainTrack.isApproaching
+        return SpeakDecision(msg, priority, finalVibrateMs, requestScan, interruptSpeech = doInterrupt)
     }
 
     fun reset() {
         lastSig = null
         lastLevel = -1
         lastSpeakTime = 0L
-        speakCount = 0
-        groupSpeakCount = 0
-        lastGroupLabel = ""
+        lastDoorAnnounce = 0L
+        recentMaxLevel = -1
         warnedFarObjects.clear()
     }
 }

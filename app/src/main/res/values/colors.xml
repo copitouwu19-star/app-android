@@ -7,4 +7,15 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- ── Paleta semántica (MODO CLARO por defecto; el oscuro está en values-night) ──
+         Sin morado: grises neutros + acento verde. Cambia sola con modo claro/oscuro. -->
+    <color name="bg_screen">#F4F5F7</color>
+    <color name="bg_card">#FFFFFF</color>
+    <color name="text_primary">#15181E</color>
+    <color name="text_secondary">#5B6068</color>
+    <color name="label">#6B7280</color>
+    <color name="accent">#0E9E72</color>
+    <color name="btn_bg">#0E9E72</color>
+    <color name="circle_bg">#E3E6EA</color>
 </resources>

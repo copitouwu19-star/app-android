@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MODO OSCURO: mismos nombres, valores oscuros. Android los usa solo en modo noche. -->
+<resources>
+    <color name="bg_screen">#0E1116</color>
+    <color name="bg_card">#1A1E26</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B6BDC6</color>
+    <color name="label">#8A93A0</color>
+    <color name="accent">#3DDC97</color>
+    <color name="btn_bg">#2A2F3A</color>
+    <color name="circle_bg">#262B35</color>
+</resources>

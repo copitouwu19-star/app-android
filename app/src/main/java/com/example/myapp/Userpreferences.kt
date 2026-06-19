@@ -26,9 +26,15 @@ class UserPreferences(context: Context) {
         private const val KEY_VIBRACION        = "vibracionActivada"
         private const val KEY_VOZ_NOMBRE       = "vozNombre"
         private const val KEY_PERFIL_TONO      = "perfilTono"
+        private const val KEY_ID_DISPOSITIVO   = "idDispositivo"
+        private const val KEY_TEMA_OSCURO      = "temaOscuro"
 
         // Valores por defecto
-        private const val DEFAULT_DISTANCIA   = "1m"
+        // Distancia de alerta por defecto = "2m" (la MÁS anticipada): el usuario nuevo arranca
+        // protegido (avisos tempranos) y puede bajarla si quiere menos charla. Decisión de
+        // mentor: ante la duda, priorizar seguridad/tiempo de reacción. El piso de seguridad
+        // (personas/vehículos/colisión inminente) avisa siempre, sin importar este valor.
+        private const val DEFAULT_DISTANCIA   = "2m"
         private const val DEFAULT_VELOCIDAD   = "normal"
         private const val DEFAULT_SILENCIOSO  = false
         private const val DEFAULT_VIBRACION   = true
@@ -70,6 +76,26 @@ class UserPreferences(context: Context) {
     var perfilTono: String
         get() = prefs.getString(KEY_PERFIL_TONO, DEFAULT_TONO) ?: DEFAULT_TONO
         set(value) = prefs.edit().putString(KEY_PERFIL_TONO, value).apply()
+
+    /**
+     * ID anónimo del dispositivo (SIN login). Se genera una sola vez al primer uso y persiste.
+     * Identifica a cada "usuario" en la base de la nube para poder distinguir sus datos.
+     */
+    /** Tema visual de la app. true = oscuro (por defecto), false = claro. Es SOLO para la
+     *  demostración en pantalla (un usuario ciego no lo necesita); no se cambia por voz. */
+    var temaOscuro: Boolean
+        get() = prefs.getBoolean(KEY_TEMA_OSCURO, true)
+        set(value) = prefs.edit().putBoolean(KEY_TEMA_OSCURO, value).apply()
+
+    val idDispositivo: String
+        get() {
+            var id = prefs.getString(KEY_ID_DISPOSITIVO, null)
+            if (id.isNullOrEmpty()) {
+                id = java.util.UUID.randomUUID().toString()
+                prefs.edit().putString(KEY_ID_DISPOSITIVO, id).apply()
+            }
+            return id
+        }
 
     /**
      * Convierte el perfil de tono al pitch de TTS.
@@ -115,8 +141,8 @@ class UserPreferences(context: Context) {
      */
     fun getDepthThreshold(): Float = when (distanciaAlerta) {
         "0.5m" -> 0.62f
-        "2m"   -> 0.32f
-        else   -> 0.48f   // "1m" es el default
+        "2m"   -> 0.32f   // default: avisa anticipado (~5m)
+        else   -> 0.48f   // "1m" intermedio (~3-4m)
     }
 
 }
